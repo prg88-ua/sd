@@ -6,6 +6,9 @@ import sqlite3
 import time
 import os
 
+from flask import Flask, jsonify
+from flask_cors import CORS
+
 # Ruta a la base de datos (reutilizando tu diseño)
 DB_NAME = os.path.join(os.path.dirname(__file__), 'water_management.db')
 
@@ -93,6 +96,39 @@ class KafkaManager(threading.Thread):
             time.sleep(2) # Simulación de escucha bloqueante
 
 # =====================================================================
+# 5. SERVIDOR WEB API (Para el Dashboard HTML)
+# =====================================================================
+app = Flask(__name__)
+CORS(app) # Permite que tu archivo HTML lea los datos sin bloqueos de seguridad
+
+@app.route('/api/stations', methods=['GET'])
+def get_stations():
+    """Lee las estaciones de la BD y las devuelve a la web en formato JSON"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        conn.row_factory = sqlite3.Row # Para leer como diccionario
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM watering_stations")
+        rows = cursor.fetchall()
+        conn.close()
+        
+        # Convertimos las filas a una lista de diccionarios
+        stations = [dict(row) for row in rows]
+        return jsonify(stations)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+class ApiServer(threading.Thread):
+    def __init__(self, port):
+        super().__init__()
+        self.port = port
+        
+    def run(self):
+        print(f"[API] Servidor Web para el Dashboard iniciado en el puerto {self.port}...")
+        # debug=False es obligatorio si Flask corre dentro de un hilo
+        app.run(host='0.0.0.0', port=self.port, debug=False, use_reloader=False)
+
+# =====================================================================
 # 4. FUNCIÓN PRINCIPAL
 # =====================================================================
 def main():
@@ -119,6 +155,10 @@ def main():
     kafka_manager = KafkaManager(args.kafka_broker)
     kafka_manager.daemon = True
     kafka_manager.start()
+
+    api_server = ApiServer(5000)
+    api_server.daemon = True
+    api_server.start()
 
     # 5. Mantener el programa principal vivo
     try:

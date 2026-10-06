@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panel de Monitorización - CENTRAL</title>
+    <!-- Cargamos Tailwind CSS para los colores y estilos rápidos -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Animación para el color VERDE PARPADEANDO que pide la práctica */
+        @keyframes blink { 50% { opacity: 0.5; } }
+        .blink-green { animation: blink 1s linear infinite; background-color: #22c55e; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white font-sans p-8">
+
+    <div class="max-w-6xl mx-auto">
+        <h1 class="text-3xl font-bold mb-6">Panel de Control: Water Management</h1>
+        
+        <div class="bg-gray-800 rounded-lg shadow-lg overflow-hidden">
+            <table class="w-full text-left">
+                <thead class="bg-gray-700 text-gray-300">
+                    <tr>
+                        <th class="p-4">ID Estación</th>
+                        <th class="p-4">Ubicación</th>
+                        <th class="p-4">Caudal (L/min)</th>
+                        <th class="p-4">Volumen (L)</th>
+                        <th class="p-4">Operario</th>
+                        <th class="p-4 text-center">Estado</th>
+                    </tr>
+                </thead>
+                <tbody id="stations-table-body">
+                    <!-- Aquí se inyectarán las filas con JavaScript -->
+                    <tr>
+                        <td colspan="6" class="p-4 text-center text-gray-400">Esperando datos de la Central...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Esta función pide los datos a la Central y dibuja la tabla
+        async function fetchStations() {
+            try {
+                // Haremos la petición a la API que programaremos en la Central
+                const response = await fetch('http://localhost:5000/api/stations');
+                const stations = await response.json();
+                
+                const tbody = document.getElementById('stations-table-body');
+                tbody.innerHTML = ''; // Limpiamos la tabla
+
+                stations.forEach(ws => {
+                    // Elegimos el color según el estado (Requisito del PDF)
+                    let bgClass = "bg-gray-500 text-white"; // OFFLINE por defecto
+                    if (ws.status === 'AVAILABLE') bgClass = "bg-green-500 text-white";
+                    if (ws.status === 'WATERING') bgClass = "blink-green text-white";
+                    if (ws.status === 'LEAK') bgClass = "bg-red-500 text-white";
+                    if (ws.status === 'OUT_OF_SERVICE') bgClass = "bg-orange-500 text-white";
+
+                    // Creamos la fila
+                    const row = `
+                        <tr class="border-b border-gray-700 hover:bg-gray-750">
+                            <td class="p-4 font-mono">${ws.id}</td>
+                            <td class="p-4">${ws.location}</td>
+                            <td class="p-4 font-mono">${ws.current_flow}</td>
+                            <td class="p-4 font-mono">${ws.accumulated_volume}</td>
+                            <td class="p-4">${ws.current_operator || '-'}</td>
+                            <td class="p-4 text-center">
+                                <span class="${bgClass} px-3 py-1 rounded-full font-bold text-sm">
+                                    ${ws.status}
+                                </span>
+                            </td>
+                        </tr>
+                    `;
+                    tbody.innerHTML += row;
+                });
+            } catch (error) {
+                console.error("Error conectando con la Central:", error);
+            }
+        }
+
+        // Ejecutar la actualización cada 2 segundos
+        setInterval(fetchStations, 2000);
+        fetchStations(); // Ejecutar la primera vez inmediatamente
+    </script>
+</body>
+</html>
