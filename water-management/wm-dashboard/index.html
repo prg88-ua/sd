@@ -9,30 +9,35 @@
     <style>
         /* Animación para el color VERDE PARPADEANDO que pide la práctica */
         @keyframes blink { 50% { opacity: 0.5; } }
-        .blink-green { animation: blink 1s linear infinite; background-color: #22c55e; }
+        .blink-green { animation: blink 1.5s linear infinite; background-color: #22c55e; }
     </style>
 </head>
 <body class="bg-gray-900 text-white font-sans p-8">
 
     <div class="max-w-6xl mx-auto">
-        <h1 class="text-3xl font-bold mb-6">Panel de Control: Water Management</h1>
+        <h1 class="text-3xl font-bold mb-6 text-blue-400">Panel de Control: Water Management</h1>
         
-        <div class="bg-gray-800 rounded-lg shadow-lg overflow-hidden">
+        <!-- Tarjetas de Resumen (NUEVO) -->
+        <div class="grid grid-cols-5 gap-4 mb-6" id="summary-cards">
+            <!-- JS inyectará aquí los contadores -->
+        </div>
+
+        <!-- Tabla principal -->
+        <div class="bg-gray-800 rounded-lg shadow-lg overflow-hidden border border-gray-700">
             <table class="w-full text-left">
                 <thead class="bg-gray-700 text-gray-300">
                     <tr>
                         <th class="p-4">ID Estación</th>
                         <th class="p-4">Ubicación</th>
-                        <th class="p-4">Caudal (L/min)</th>
-                        <th class="p-4">Volumen (L)</th>
-                        <th class="p-4">Operario</th>
+                        <th class="p-4 text-center">Caudal (L/min)</th>
+                        <th class="p-4 text-center">Volumen (L)</th>
+                        <th class="p-4 text-center">Operario</th>
                         <th class="p-4 text-center">Estado</th>
                     </tr>
                 </thead>
                 <tbody id="stations-table-body">
-                    <!-- Aquí se inyectarán las filas con JavaScript -->
                     <tr>
-                        <td colspan="6" class="p-4 text-center text-gray-400">Esperando datos de la Central...</td>
+                        <td colspan="6" class="p-4 text-center text-gray-400">Esperando conexión con CENTRAL...</td>
                     </tr>
                 </tbody>
             </table>
@@ -40,49 +45,95 @@
     </div>
 
     <script>
-        // Esta función pide los datos a la Central y dibuja la tabla
         async function fetchStations() {
             try {
-                // Haremos la petición a la API que programaremos en la Central
                 const response = await fetch('http://localhost:5000/api/stations');
                 const stations = await response.json();
                 
                 const tbody = document.getElementById('stations-table-body');
-                tbody.innerHTML = ''; // Limpiamos la tabla
+                tbody.innerHTML = ''; 
+
+                // Objeto para contar cuántas estaciones hay en cada estado
+                let counts = { AVAILABLE: 0, WATERING: 0, LEAK: 0, OUT_OF_SERVICE: 0, OFFLINE: 0 };
 
                 stations.forEach(ws => {
-                    // Elegimos el color según el estado (Requisito del PDF)
-                    let bgClass = "bg-gray-500 text-white"; // OFFLINE por defecto
-                    if (ws.status === 'AVAILABLE') bgClass = "bg-green-500 text-white";
-                    if (ws.status === 'WATERING') bgClass = "blink-green text-white";
-                    if (ws.status === 'LEAK') bgClass = "bg-red-500 text-white";
-                    if (ws.status === 'OUT_OF_SERVICE') bgClass = "bg-orange-500 text-white";
+                    // Sumamos +1 al contador que corresponda
+                    if(counts[ws.status] !== undefined) counts[ws.status]++;
 
-                    // Creamos la fila
+                    // Mapeo exacto de los requisitos del PDF (Colores y Textos)
+                    let bgClass = "bg-gray-500 text-white"; 
+                    let legend = "Desconectada";
+
+                    if (ws.status === 'AVAILABLE') {
+                        bgClass = "bg-green-500 text-white";
+                        legend = "Disponible";
+                    } else if (ws.status === 'WATERING') {
+                        bgClass = "blink-green text-white";
+                        legend = "Regando";
+                    } else if (ws.status === 'LEAK') {
+                        bgClass = "bg-red-600 text-white";
+                        legend = "Fuga";
+                    } else if (ws.status === 'OUT_OF_SERVICE') {
+                        bgClass = "bg-orange-500 text-white";
+                        legend = "Fuera de Servicio";
+                    }
+
+                    // Lógica visual: Ocultamos métricas si no está regando
+                    const isWatering = ws.status === 'WATERING';
+                    
+                    const flow = isWatering ? `<span class="text-cyan-300 font-bold">${parseFloat(ws.current_flow).toFixed(1)}</span>` : '<span class="text-gray-600">-</span>';
+                    const vol = isWatering ? `<span class="text-blue-300 font-bold">${parseFloat(ws.accumulated_volume).toFixed(1)}</span>` : '<span class="text-gray-600">-</span>';
+                    const operator = isWatering ? `<span class="text-yellow-300 font-bold">${ws.current_operator}</span>` : '<span class="text-gray-600">-</span>';
+
                     const row = `
-                        <tr class="border-b border-gray-700 hover:bg-gray-750">
-                            <td class="p-4 font-mono">${ws.id}</td>
-                            <td class="p-4">${ws.location}</td>
-                            <td class="p-4 font-mono">${ws.current_flow}</td>
-                            <td class="p-4 font-mono">${ws.accumulated_volume}</td>
-                            <td class="p-4">${ws.current_operator || '-'}</td>
+                        <tr class="border-b border-gray-700 hover:bg-gray-750 transition-colors">
+                            <td class="p-4 font-mono font-bold text-gray-200">${ws.id}</td>
+                            <td class="p-4 text-gray-300">${ws.location}</td>
+                            <td class="p-4 font-mono text-center">${flow}</td>
+                            <td class="p-4 font-mono text-center">${vol}</td>
+                            <td class="p-4 font-mono text-center">${operator}</td>
                             <td class="p-4 text-center">
-                                <span class="${bgClass} px-3 py-1 rounded-full font-bold text-sm">
-                                    ${ws.status}
+                                <span class="${bgClass} px-3 py-1 rounded-full font-bold text-xs uppercase tracking-wide">
+                                    ${legend}
                                 </span>
                             </td>
                         </tr>
                     `;
                     tbody.innerHTML += row;
                 });
+
+                // Inyectamos las tarjetas resumen con los conteos dinámicos
+                document.getElementById('summary-cards').innerHTML = `
+                    <div class="bg-gray-800 p-4 rounded-lg text-center border-t-4 border-green-500 shadow">
+                        <div class="text-4xl font-black text-green-400">${counts.AVAILABLE}</div>
+                        <div class="text-xs text-gray-400 uppercase font-bold mt-1">Disponibles</div>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg text-center border-t-4 border-green-400 shadow">
+                        <div class="text-4xl font-black text-white">${counts.WATERING}</div>
+                        <div class="text-xs text-gray-400 uppercase font-bold mt-1">Regando</div>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg text-center border-t-4 border-red-500 shadow">
+                        <div class="text-4xl font-black text-red-500">${counts.LEAK}</div>
+                        <div class="text-xs text-gray-400 uppercase font-bold mt-1">Fugas</div>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg text-center border-t-4 border-orange-500 shadow">
+                        <div class="text-4xl font-black text-orange-400">${counts.OUT_OF_SERVICE}</div>
+                        <div class="text-xs text-gray-400 uppercase font-bold mt-1">Paradas</div>
+                    </div>
+                    <div class="bg-gray-800 p-4 rounded-lg text-center border-t-4 border-gray-500 shadow">
+                        <div class="text-4xl font-black text-gray-500">${counts.OFFLINE}</div>
+                        <div class="text-xs text-gray-400 uppercase font-bold mt-1">Desconectadas</div>
+                    </div>
+                `;
+
             } catch (error) {
                 console.error("Error conectando con la Central:", error);
             }
         }
 
-        // Ejecutar la actualización cada 2 segundos
-        setInterval(fetchStations, 2000);
-        fetchStations(); // Ejecutar la primera vez inmediatamente
+        // Actualizamos cada 1 segundo para que la telemetría se vea rapidísima
+        setInterval(fetchStations, 1000);
+        fetchStations(); 
     </script>
 </body>
 </html>
