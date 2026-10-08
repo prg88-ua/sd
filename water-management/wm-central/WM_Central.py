@@ -1,27 +1,25 @@
 import argparse
 import socket
 import threading
-import json
 import sqlite3
 import time
 import os
+from datetime import datetime
 
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-# Ruta a la base de datos (reutilizando tu diseño)
 DB_NAME = os.path.join(os.path.dirname(__file__), 'water_management.db')
 
 # =====================================================================
 # 1. GESTIÓN DE BASE DE DATOS
 # =====================================================================
+def get_db_connection():
+    return sqlite3.connect(DB_NAME)
+
 def reset_stations_to_offline():
-    """
-    Según el PDF: 'CENTRAL comprobará en su BD si ya tiene estaciones... 
-    hasta que no conecten, las mostrará con el estado DESCONECTADA (OFFLINE)'.
-    """
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("UPDATE watering_stations SET status = 'OFFLINE'")
         conn.commit()
@@ -29,6 +27,77 @@ def reset_stations_to_offline():
         print("[BD] Todas las estaciones han sido inicializadas en estado OFFLINE.")
     except Exception as e:
         print(f"[BD Error] No se pudo conectar a la BD: {e}")
+
+def register_station(ws_id, location):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Comprobar si la estación ya existe en la tabla
+    cursor.execute("SELECT id FROM watering_stations WHERE id = ?", (ws_id,))
+    exists = cursor.fetchone()
+    
+    now = datetime.now().isoformat()
+    if exists:
+        # Si ya existe, actualizamos ubicación, estado y timestamp
+        cursor.execute(
+            "UPDATE watering_stations SET location = ?, status = 'AVAILABLE', last_health_check = ? WHERE id = ?",
+            (location, now, ws_id)
+        )
+    else:
+        # Si es nueva, la insertamos
+        cursor.execute(
+            "INSERT INTO watering_stations (id, location, status, last_health_check) VALUES (?, ?, 'AVAILABLE', ?)",
+            (ws_id, location, now)
+        )
+    conn.commit()
+    conn.close()
+
+def update_health(ws_id, status_code):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    
+    # Si el Monitor reporta OK, está disponible. Si reporta KO, avería (fuera de servicio).
+    new_status = 'AVAILABLE' if status_code == 'OK' else 'OUT_OF_SERVICE'
+    
+    cursor.execute(
+        "UPDATE watering_stations SET status = ?, last_health_check = ? WHERE id = ?",
+        (new_status, now, ws_id)
+    )
+    conn.commit()
+    conn.close()
+
+def mark_offline_if_inactive(timeout_seconds=5):
+    """Revisa si alguna estación lleva más de X segundos sin enviar latido (health check)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, last_health_check, status FROM watering_stations WHERE status != 'OFFLINE'")
+    rows = cursor.fetchall()
+    
+    now = datetime.now()
+    for row in rows:
+        ws_id, last_health_str, status = row
+        if last_health_str:
+            try:
+                last_health = datetime.fromisoformat(last_health_str)
+                diff = (now - last_health).total_seconds()
+                if diff > timeout_seconds:
+                    cursor.execute("UPDATE watering_stations SET status = 'OFFLINE' WHERE id = ?", (ws_id,))
+                    print(f"[VIGÍA] Estación {ws_id} marcada como OFFLINE (sin respuesta en {diff:.1f}s)")
+            except ValueError:
+                pass
+    
+    conn.commit()
+    conn.close()
+
+def mark_station_offline(ws_id):
+    """Marca explícitamente una estación como offline (ej: al desconectarse el socket)"""
+    if ws_id:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE watering_stations SET status = 'OFFLINE' WHERE id = ?", (ws_id,))
+        conn.commit()
+        conn.close()
+
 
 # =====================================================================
 # 2. SERVIDOR DE SOCKETS (Para los Monitores WM_WS_M)
@@ -38,43 +107,106 @@ class SocketServer(threading.Thread):
         super().__init__()
         self.port = port
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Permite reutilizar el puerto rápido si cerramos el programa
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.server_socket.bind(('0.0.0.0', self.port))
-        self.server_socket.listen(10) # Escucha hasta 10 conexiones simultáneas
+        self.server_socket.listen(10)
+        
+        # Set para vigilar que dos monitores no usen el mismo ID a la vez
+        self.connected_stations = set() 
+        self.lock = threading.Lock()
         
     def run(self):
         print(f"[SOCKETS] Servidor escuchando en el puerto {self.port}...")
         while True:
-            # Espera bloqueante hasta que un Monitor (WM_WS_M) se conecta
             client_socket, addr = self.server_socket.accept()
             print(f"[SOCKETS] Nueva conexión desde {addr}")
             
-            # Lanzamos un hilo nuevo para atender a esta estación específica
-            # Así el servidor principal puede seguir escuchando a otras
             client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
             client_thread.daemon = True
             client_thread.start()
 
     def handle_client(self, client_socket):
-        """Maneja la comunicación constante (heartbeats) con un Monitor de WS"""
+        buffer = ""
+        current_ws_id = None
+        
+        def send_msg(msg):
+            # Helper para añadir el salto de línea requerido por el contrato
+            client_socket.sendall((msg + "\n").encode('utf-8'))
+            
         try:
             while True:
                 data = client_socket.recv(1024)
                 if not data:
-                    break # El cliente se ha desconectado
+                    break # Si data está vacío, el cliente cerró la conexión
                 
-                mensaje = data.decode('utf-8')
-                # Aquí procesaremos el protocolo: <STX><DATA><ETX><LRC> 
-                # o el formato JSON que decidamos usar.
-                print(f"[SOCKETS] Recibido: {mensaje}")
+                buffer += data.decode('utf-8')
                 
-                # Respuesta de ejemplo: ACK
-                respuesta = "ACK\n"
-                client_socket.send(respuesta.encode('utf-8'))
-                
+                # Vamos extrayendo mensajes completos que terminen en salto de línea
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                        
+                    fields = line.split("#")
+                    command = fields[0]
+                    
+                    # ---- COMANDO: REGISTRO ----
+                    if command == "REGISTRO":
+                        if len(fields) != 3:
+                            send_msg("STATUS#ERROR#INVALID_MESSAGE")
+                            continue
+                            
+                        ws_id = fields[1]
+                        location = fields[2]
+                        
+                        # Bloqueamos para evitar condiciones de carrera si se conectan dos a la vez
+                        with self.lock:
+                            if ws_id in self.connected_stations:
+                                send_msg("STATUS#ERROR#DUPLICATE_STATION")
+                                continue
+                            self.connected_stations.add(ws_id)
+                            current_ws_id = ws_id
+                            
+                        register_station(ws_id, location)
+                        send_msg("STATUS#OK#REGISTERED")
+                        print(f"[SOCKETS] Estación registrada: {ws_id} en {location}")
+                        
+                    # ---- COMANDO: HEALTH ----
+                    elif command == "HEALTH":
+                        if len(fields) != 3:
+                            send_msg("STATUS#ERROR#INVALID_MESSAGE")
+                            continue
+                            
+                        ws_id = fields[1]
+                        status_code = fields[2] # OK o KO
+                        
+                        # Validamos que el ID coincida con el que se registró inicialmente
+                        if current_ws_id != ws_id:
+                            send_msg("STATUS#ERROR#INVALID_MESSAGE")
+                            continue
+                            
+                        update_health(ws_id, status_code)
+                        send_msg("STATUS#OK#HEALTH_RECEIVED")
+                        
+                    # ---- COMANDO DESCONOCIDO ----
+                    else:
+                        send_msg("STATUS#ERROR#INVALID_MESSAGE")
+                        
         except ConnectionResetError:
             print("[SOCKETS] Un monitor se ha desconectado abruptamente.")
+        except Exception as e:
+            print(f"[SOCKETS] Error con cliente: {e}")
         finally:
             client_socket.close()
+            # Cuando el Monitor se desconecta, liberamos su ID y actualizamos la BD
+            if current_ws_id:
+                with self.lock:
+                    if current_ws_id in self.connected_stations:
+                        self.connected_stations.remove(current_ws_id)
+                mark_station_offline(current_ws_id)
+                print(f"[SOCKETS] Estación {current_ws_id} desconectada y liberada.")
 
 # =====================================================================
 # 3. GESTOR DE KAFKA (Para los Engines WM_WS_E y Operarios WM_FO)
@@ -83,36 +215,29 @@ class KafkaManager(threading.Thread):
     def __init__(self, broker_address):
         super().__init__()
         self.broker_address = broker_address
-        # Aquí inicializaríamos el consumidor y productor de Kafka
-        # self.consumer = KafkaConsumer(...)
-        # self.producer = KafkaProducer(...)
 
     def run(self):
         print(f"[KAFKA] Gestor de mensajería iniciado conectando a {self.broker_address}...")
         while True:
-            # Aquí irá el bucle que lee los mensajes de Kafka
-            # msg = self.consumer.poll(1.0)
-            # Procesar peticiones de FO o telemetría de WS_E
-            time.sleep(2) # Simulación de escucha bloqueante
+            # Aquí irá la lógica de Kafka más adelante
+            time.sleep(2)
 
 # =====================================================================
 # 5. SERVIDOR WEB API (Para el Dashboard HTML)
 # =====================================================================
 app = Flask(__name__)
-CORS(app) # Permite que tu archivo HTML lea los datos sin bloqueos de seguridad
+CORS(app)
 
 @app.route('/api/stations', methods=['GET'])
 def get_stations():
-    """Lee las estaciones de la BD y las devuelve a la web en formato JSON"""
     try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.row_factory = sqlite3.Row # Para leer como diccionario
+        conn = get_db_connection()
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM watering_stations")
         rows = cursor.fetchall()
         conn.close()
         
-        # Convertimos las filas a una lista de diccionarios
         stations = [dict(row) for row in rows]
         return jsonify(stations)
     except Exception as e:
@@ -125,14 +250,12 @@ class ApiServer(threading.Thread):
         
     def run(self):
         print(f"[API] Servidor Web para el Dashboard iniciado en el puerto {self.port}...")
-        # debug=False es obligatorio si Flask corre dentro de un hilo
         app.run(host='0.0.0.0', port=self.port, debug=False, use_reloader=False)
 
 # =====================================================================
 # 4. FUNCIÓN PRINCIPAL
 # =====================================================================
 def main():
-    # 1. Leer los parámetros por línea de comandos (Requisito del PDF)
     parser = argparse.ArgumentParser(description="Módulo CENTRAL de WaterManagement")
     parser.add_argument("--socket-port", type=int, required=True, help="Puerto de escucha del servidor de Sockets")
     parser.add_argument("--kafka-broker", type=str, required=True, help="IP y puerto del Broker de Kafka")
@@ -143,28 +266,29 @@ def main():
     print("        INICIANDO WATER MANAGEMENT CENTRAL        ")
     print("==================================================")
 
-    # 2. Inicializar el estado de la BD
+    # 1. Al iniciar la central, todas las estaciones de la BD pasan a OFFLINE
     reset_stations_to_offline()
 
-    # 3. Iniciar Servidor de Sockets en un Hilo
+    # 2. Iniciar Servidor de Sockets en un Hilo
     socket_server = SocketServer(args.socket_port)
-    socket_server.daemon = True # Si Central se cierra, este hilo también se cierra
+    socket_server.daemon = True
     socket_server.start()
 
-    # 4. Iniciar Gestor de Kafka en un Hilo
+    # 3. Iniciar Gestor de Kafka en un Hilo
     kafka_manager = KafkaManager(args.kafka_broker)
     kafka_manager.daemon = True
     kafka_manager.start()
 
+    # 4. Iniciar API Web Flask en un Hilo
     api_server = ApiServer(5000)
     api_server.daemon = True
     api_server.start()
 
-    # 5. Mantener el programa principal vivo
+    # 5. Bucle principal y VIGÍA (Timeout de 5 segundos)
     try:
         while True:
-            # Aquí Central podría hacer tareas periódicas de limpieza
-            # o simplemente mantenerse a la espera.
+            # Cada segundo comprobamos si hay alguna estación que se haya quedado en silencio
+            mark_offline_if_inactive(timeout_seconds=5)
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n[CENTRAL] Apagando el sistema central...")
