@@ -6,11 +6,14 @@ import time
 import os
 from datetime import datetime
 
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, send_from_directory, request
 from flask_cors import CORS
 from kafka import KafkaConsumer, KafkaProducer
 
 DB_NAME = os.path.join(os.path.dirname(__file__), 'water_management.db')
+
+# Variable global para que el menú y la API puedan enviar mensajes por Kafka
+kafka_manager_global = None
 
 # =====================================================================
 # 1. GESTIÓN DE BASE DE DATOS
@@ -54,26 +57,27 @@ def update_health(ws_id, status_code):
     cursor = conn.cursor()
     now = datetime.now().isoformat()
     
+    cursor.execute("SELECT status FROM watering_stations WHERE id = ?", (ws_id,))
+    row = cursor.fetchone()
+    current_status = row[0] if row else None
+    
+    # Si la estación fue bloqueada manualmente por Central, no la reactivamos por un latido OK
+    if current_status == 'OUT_OF_SERVICE' and status_code == 'OK':
+        conn.close()
+        return
+
     if status_code == 'KO':
-        # Si hay avería, siempre pasa a LEAK y cortamos el agua
         cursor.execute(
             "UPDATE watering_stations SET status = 'LEAK', current_flow = 0.0, last_health_check = ? WHERE id = ?",
             (now, ws_id)
         )
     else:
-        # Si status_code == 'OK', solo cambiamos a AVAILABLE si NO estaba regando
-        cursor.execute("SELECT status FROM watering_stations WHERE id = ?", (ws_id,))
-        row = cursor.fetchone()
-        current_status = row[0] if row else None
-        
         if current_status == 'WATERING':
-            # Sigue regando, solo actualizamos el timestamp del latido
             cursor.execute(
                 "UPDATE watering_stations SET last_health_check = ? WHERE id = ?",
                 (now, ws_id)
             )
         else:
-            # Pasa a disponible normalmente
             cursor.execute(
                 "UPDATE watering_stations SET status = 'AVAILABLE', last_health_check = ? WHERE id = ?",
                 (now, ws_id)
@@ -81,9 +85,8 @@ def update_health(ws_id, status_code):
             
     conn.commit()
     conn.close()
-    
+
 def mark_offline_if_inactive(timeout_seconds=5):
-    """Revisa si alguna estación lleva más de X segundos sin enviar latido"""
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT id, last_health_check, status FROM watering_stations WHERE status != 'OFFLINE'")
@@ -113,19 +116,16 @@ def mark_station_offline(ws_id):
         conn.commit()
         conn.close()
 
-# ---- FUNCIONES DE RIEGO PARA KAFKA ----
 def check_can_water(ws_id, operator_id):
-    """Valida operario y disponibilidad de la estación según la BD."""
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Validar operario
-    cursor.execute("SELECT id FROM operators WHERE id = ?", (operator_id,))
-    if not cursor.fetchone():
-        conn.close()
-        return False, "OPERARIO_NO_REGISTRADO"
+    if operator_id != 'CENTRAL':
+        cursor.execute("SELECT id FROM operators WHERE id = ?", (operator_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return False, "OPERARIO_NO_REGISTRADO"
 
-    # 2. Validar estación y su estado
     cursor.execute("SELECT status FROM watering_stations WHERE id = ?", (ws_id,))
     row = cursor.fetchone()
     if not row:
@@ -174,6 +174,84 @@ def finish_irrigation_db(ws_id, operator_id, duration_seconds, flow=15.0):
     conn.commit()
     conn.close()
     return volumen_litros
+
+
+# =====================================================================
+# ACCIONES DE ADMINISTRACIÓN (CENTRAL: Regar, Bloquear, Activar)
+# =====================================================================
+def admin_block_station(ws_id):
+    """Bloquea una o todas las estaciones y cancela riegos activos."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    if ws_id == 'ALL':
+        cursor.execute("UPDATE watering_stations SET status = 'OUT_OF_SERVICE', current_flow = 0.0, current_operator = NULL WHERE status != 'OFFLINE'")
+        if kafka_manager_global and kafka_manager_global.producer:
+            kafka_manager_global.producer.send('ws_orders', value="STOP#ALL")
+            kafka_manager_global.producer.flush()
+        print("[CENTRAL ADMIN] ⛔ TODAS las estaciones han sido BLOQUEADAS (Out of Service).")
+    else:
+        cursor.execute("UPDATE watering_stations SET status = 'OUT_OF_SERVICE', current_flow = 0.0, current_operator = NULL WHERE id = ?", (ws_id,))
+        if kafka_manager_global and kafka_manager_global.producer:
+            kafka_manager_global.producer.send('ws_orders', value=f"STOP#{ws_id}")
+            kafka_manager_global.producer.flush()
+        print(f"[CENTRAL ADMIN] ⛔ Estación {ws_id} BLOQUEADA (Out of Service).")
+        
+    conn.commit()
+    conn.close()
+
+def admin_activate_station(ws_id):
+    """Devuelve una estación bloqueada a disponible (Verde)."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    
+    if ws_id == 'ALL':
+        cursor.execute("UPDATE watering_stations SET status = 'AVAILABLE', last_health_check = ? WHERE status = 'OUT_OF_SERVICE'", (now,))
+        print("[CENTRAL ADMIN] ✅ TODAS las estaciones bloqueadas han sido ACTIVADAS.")
+    else:
+        cursor.execute("UPDATE watering_stations SET status = 'AVAILABLE', last_health_check = ? WHERE id = ?", (now, ws_id))
+        print(f"[CENTRAL ADMIN] ✅ Estación {ws_id} ACTIVADA (Disponible).")
+        
+    conn.commit()
+    conn.close()
+
+def admin_start_irrigation(ws_id, duration=10):
+    """Inicia un riego ordenado desde Central."""
+    if ws_id == 'ALL':
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM watering_stations WHERE status = 'AVAILABLE'")
+        available_stations = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        for sid in available_stations:
+            start_irrigation_db(sid, 'CENTRAL', flow=15.0)
+            if kafka_manager_global and kafka_manager_global.producer:
+                kafka_manager_global.producer.send('ws_orders', value=f"START#{sid}#CENTRAL#{duration}")
+            
+            def sim_end(s_id, dur):
+                time.sleep(dur)
+                finish_irrigation_db(s_id, 'CENTRAL', dur, flow=15.0)
+            threading.Thread(target=sim_end, args=(sid, duration), daemon=True).start()
+            
+        if kafka_manager_global and kafka_manager_global.producer:
+            kafka_manager_global.producer.flush()
+        print(f"[CENTRAL ADMIN] 💧 Riego iniciado en TODAS las disponibles ({duration}s).")
+    else:
+        can_water, reason = check_can_water(ws_id, 'CENTRAL')
+        if can_water:
+            start_irrigation_db(ws_id, 'CENTRAL', flow=15.0)
+            if kafka_manager_global and kafka_manager_global.producer:
+                kafka_manager_global.producer.send('ws_orders', value=f"START#{ws_id}#CENTRAL#{duration}")
+                kafka_manager_global.producer.flush()
+                
+            def sim_end(s_id, dur):
+                time.sleep(dur)
+                finish_irrigation_db(s_id, 'CENTRAL', dur, flow=15.0)
+            threading.Thread(target=sim_end, args=(ws_id, duration), daemon=True).start()
+            print(f"[CENTRAL ADMIN] 💧 Riego iniciado en {ws_id} ({duration}s).")
+        else:
+            print(f"[CENTRAL ADMIN] ❌ No se pudo iniciar riego en {ws_id}: {reason}")
 
 
 # =====================================================================
@@ -308,7 +386,6 @@ class KafkaManager(threading.Thread):
             parts = raw_text.split("#")
             command = parts[0]
             
-            # Formato esperado: REQUEST#<id_operario>#<ws_id>#<duracion>
             if command == "REQUEST" and len(parts) >= 4:
                 operator_id = parts[1]
                 ws_id = parts[2]
@@ -323,13 +400,10 @@ class KafkaManager(threading.Thread):
                     print(f"[KAFKA] ✅ Autorizando riego en {ws_id} para {operator_id} ({duration}s)")
                     start_irrigation_db(ws_id, operator_id, flow=15.0)
                     
-                    # 1. Autorizar al operario
                     self.producer.send('fo_responses', value=f"ACK#{operator_id}#ACEPTADO")
-                    # 2. Enviar orden de arranque a la estación
                     self.producer.send('ws_orders', value=f"START#{ws_id}#{operator_id}#{duration}")
                     self.producer.flush()
 
-                    # Hilo simulador de duración de riego
                     def simulate_watering_end(wid, opid, dur):
                         time.sleep(dur)
                         volumen = finish_irrigation_db(wid, opid, dur, flow=15.0)
@@ -351,10 +425,15 @@ class KafkaManager(threading.Thread):
 app = Flask(__name__)
 CORS(app)
 
-# Servir el panel directamente al abrir http://localhost:5000/
 @app.route('/', methods=['GET'])
+@app.route('/index.html', methods=['GET'])
 def index():
-    dashboard_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'wm-dashboard'))
+    # Busca en WM_Dashboard (o en wm-dashboard si existiera)
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    dashboard_dir = os.path.join(base_dir, 'WM_Dashboard')
+    if not os.path.isdir(dashboard_dir):
+        dashboard_dir = os.path.join(base_dir, 'wm-dashboard')
+        
     return send_from_directory(dashboard_dir, 'index.html')
 
 @app.route('/api/stations', methods=['GET'])
@@ -370,6 +449,23 @@ def get_stations():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---- ENDPOINTS ADMINISTRATIVOS PARA EL DASHBOARD ----
+@app.route('/api/stations/<ws_id>/start', methods=['POST'])
+def api_start_station(ws_id):
+    duration = request.json.get('duration', 10) if request.is_json else 10
+    admin_start_irrigation(ws_id, duration)
+    return jsonify({"status": "OK", "action": "start", "ws_id": ws_id})
+
+@app.route('/api/stations/<ws_id>/block', methods=['POST'])
+def api_block_station(ws_id):
+    admin_block_station(ws_id)
+    return jsonify({"status": "OK", "action": "block", "ws_id": ws_id})
+
+@app.route('/api/stations/<ws_id>/activate', methods=['POST'])
+def api_activate_station(ws_id):
+    admin_activate_station(ws_id)
+    return jsonify({"status": "OK", "action": "activate", "ws_id": ws_id})
+
 class ApiServer(threading.Thread):
     def __init__(self, port):
         super().__init__()
@@ -381,9 +477,55 @@ class ApiServer(threading.Thread):
 
 
 # =====================================================================
-# 5. FUNCIÓN PRINCIPAL
+# 5. MENÚ POR CONSOLA DE CENTRAL
+# =====================================================================
+def console_menu():
+    time.sleep(2)
+    while True:
+        try:
+            print("\n" + "="*45)
+            print("       MENÚ DE CONTROL CENTRAL (ADMIN)       ")
+            print("="*45)
+            print("1. Iniciar Riego Manual en Estación")
+            print("2. Bloquear Estación (Out of Service)")
+            print("3. Activar Estación")
+            print("4. Iniciar Riego en TODAS las disponibles")
+            print("5. Bloquear TODAS las estaciones")
+            print("6. Activar TODAS las estaciones")
+            print("="*45)
+            
+            opc = input("Selecciona opción [1-6]: ").strip()
+            if opc == '1':
+                wid = input("ID de estación (ej: WS-01): ").strip()
+                dur = input("Duración en segundos (por defecto 10): ").strip()
+                dur = int(dur) if dur else 10
+                admin_start_irrigation(wid, dur)
+            elif opc == '2':
+                wid = input("ID de estación a bloquear: ").strip()
+                admin_block_station(wid)
+            elif opc == '3':
+                wid = input("ID de estación a activar: ").strip()
+                admin_activate_station(wid)
+            elif opc == '4':
+                dur = input("Duración para todas (por defecto 10s): ").strip()
+                dur = int(dur) if dur else 10
+                admin_start_irrigation('ALL', dur)
+            elif opc == '5':
+                admin_block_station('ALL')
+            elif opc == '6':
+                admin_activate_station('ALL')
+        except (EOFError, KeyboardInterrupt):
+            break
+        except Exception as e:
+            print(f"[MENU ERROR] {e}")
+
+
+# =====================================================================
+# 6. FUNCIÓN PRINCIPAL
 # =====================================================================
 def main():
+    global kafka_manager_global
+    
     parser = argparse.ArgumentParser(description="Módulo CENTRAL de WaterManagement")
     parser.add_argument("--socket-port", type=int, required=True, help="Puerto de escucha de Sockets")
     parser.add_argument("--kafka-broker", type=str, required=True, help="IP:Puerto del Broker de Kafka")
@@ -394,25 +536,24 @@ def main():
     print("        INICIANDO WATER MANAGEMENT CENTRAL        ")
     print("==================================================")
 
-    # 1. Inicializar estados en BD
     reset_stations_to_offline()
 
-    # 2. Iniciar Servidor de Sockets
     socket_server = SocketServer(args.socket_port)
     socket_server.daemon = True
     socket_server.start()
 
-    # 3. Iniciar Gestor de Kafka
-    kafka_manager = KafkaManager(args.kafka_broker)
-    kafka_manager.daemon = True
-    kafka_manager.start()
+    kafka_manager_global = KafkaManager(args.kafka_broker)
+    kafka_manager_global.daemon = True
+    kafka_manager_global.start()
 
-    # 4. Iniciar Servidor Web Flask (puerto 5000)
     api_server = ApiServer(5000)
     api_server.daemon = True
     api_server.start()
 
-    # 5. Vigía de inactividad
+    # Iniciar menú interactivo por consola en segundo plano
+    menu_thread = threading.Thread(target=console_menu, daemon=True)
+    menu_thread.start()
+
     try:
         while True:
             mark_offline_if_inactive(timeout_seconds=5)
