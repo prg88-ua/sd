@@ -1,23 +1,51 @@
+"""
+prueba_engine.py — Simula un Engine mínimo para probar el Monitor.
+Se conecta al Monitor, responde al IDENTIFY y contesta PONG OK/KO.
+"""
+import argparse
 import socket
 import time
 
-print("[SIMULADOR] Conectando WS-01 con Central por sockets...")
-s = socket.create_connection(('localhost', 6000))
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--monitor-host", default="localhost")
+    p.add_argument("--monitor-port", type=int, required=True)
+    p.add_argument("--fallo", action="store_true", help="Responde PONG KO (simula avería)")
+    args = p.parse_args()
 
-# 1. Registrar la estación
-s.sendall(b"REGISTRO#WS-01#Parque Central\n")
-respuesta = s.recv(1024).decode().strip()
-print(f"[CENTRAL] Respuesta registro: {respuesta}")
+    print(f"[ENGINE-SIM] Conectando al Monitor en {args.monitor_host}:{args.monitor_port}…")
+    sock = socket.create_connection((args.monitor_host, args.monitor_port), timeout=5)
+    print("[ENGINE-SIM] Conectado.")
 
-# 2. Mantener la estación viva con latidos cada segundo
-print("[SIMULADOR] Enviando latidos de salud. WS-01 ahora está DISPONIBLE.")
-print("Pulsa Ctrl+C cuando quieras parar la estación.\n")
+    # 1. Enviar IDENTIFY
+    sock.sendall(b"IDENTIFY\n")
+    respuesta = sock.recv(1024).decode().strip()
+    print(f"[ENGINE-SIM] Recibido: {respuesta}")   # Debe ser IDENTITY#WS-01
 
-try:
-    while True:
-        s.sendall(b"HEALTH#WS-01#OK\n")
-        s.recv(1024)
-        time.sleep(1)
-except KeyboardInterrupt:
-    print("\n[SIMULADOR] Estación desconectada.")
-    s.close()
+    # 2. Responder a PINGs
+    estado = "KO" if args.fallo else "OK"
+    print(f"[ENGINE-SIM] Respondiendo PINGs con {estado}. Ctrl+C para parar.")
+    sock.settimeout(5.0)
+
+    try:
+        while True:
+            try:
+                data = sock.recv(1024).decode().strip()
+                if not data:
+                    break
+                print(f"[ENGINE-SIM] Recibido: {data}")
+                partes = data.split("#")
+                if partes[0] == "PING":
+                    seq = partes[1]
+                    pong = f"PONG#{seq}#{estado}\n"
+                    sock.sendall(pong.encode())
+                    print(f"[ENGINE-SIM] Enviado: {pong.strip()}")
+            except socket.timeout:
+                continue
+    except KeyboardInterrupt:
+        print("\n[ENGINE-SIM] Detenido.")
+    finally:
+        sock.close()
+
+if __name__ == "__main__":
+    main()
