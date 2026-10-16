@@ -81,10 +81,10 @@
                     // Lógica visual: Ocultamos métricas si no está regando
                     const isWatering = ws.status === 'WATERING';
                     
+                   // Caudal y Operario solo se muestran si está regando; el Volumen acumulado siempre se muestra:
                     const flow = isWatering ? `<span class="text-cyan-300 font-bold">${parseFloat(ws.current_flow).toFixed(1)}</span>` : '<span class="text-gray-600">-</span>';
-                    const vol = isWatering ? `<span class="text-blue-300 font-bold">${parseFloat(ws.accumulated_volume).toFixed(1)}</span>` : '<span class="text-gray-600">-</span>';
+                    const vol = `<span class="text-blue-300 font-bold">${parseFloat(ws.accumulated_volume || 0).toFixed(1)} L</span>`;
                     const operator = isWatering ? `<span class="text-yellow-300 font-bold">${ws.current_operator}</span>` : '<span class="text-gray-600">-</span>';
-
                     const row = `
                         <tr class="border-b border-gray-700 hover:bg-gray-750 transition-colors">
                             <td class="p-4 font-mono font-bold text-gray-200">${ws.id}</td>

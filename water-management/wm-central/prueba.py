@@ -1,15 +1,23 @@
-import sqlite3
+import socket
+import time
 
-# Nos conectamos a la BD
-conn = sqlite3.connect('water_management.db')
-cursor = conn.cursor()
+print("[SIMULADOR] Conectando WS-01 con Central por sockets...")
+s = socket.create_connection(('localhost', 6000))
 
-# Simulamos que la WS-01 se conecta y luego se pone a regar
-cursor.execute("UPDATE watering_stations SET status='AVAILABLE' WHERE id='WS-01'")
-cursor.execute("UPDATE watering_stations SET status='WATERING' WHERE id='WS-02'")
-cursor.execute("UPDATE watering_stations SET status='LEAK' WHERE id='WS-03'")
+# 1. Registrar la estación
+s.sendall(b"REGISTRO#WS-01#Parque Central\n")
+respuesta = s.recv(1024).decode().strip()
+print(f"[CENTRAL] Respuesta registro: {respuesta}")
 
-conn.commit()
-conn.close()
+# 2. Mantener la estación viva con latidos cada segundo
+print("[SIMULADOR] Enviando latidos de salud. WS-01 ahora está DISPONIBLE.")
+print("Pulsa Ctrl+C cuando quieras parar la estación.\n")
 
-print("¡Estados actualizados en la BD!")
+try:
+    while True:
+        s.sendall(b"HEALTH#WS-01#OK\n")
+        s.recv(1024)
+        time.sleep(1)
+except KeyboardInterrupt:
+    print("\n[SIMULADOR] Estación desconectada.")
+    s.close()

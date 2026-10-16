@@ -38,7 +38,7 @@ def main():
             bootstrap_servers=[args.kafka_broker],
             group_id=f'grupo_{args.id_operario}',
             value_deserializer=lambda x: x.decode('utf-8'),
-            auto_offset_reset='latest'
+            auto_offset_reset='earliest'
         )
     except Exception as e:
         print(f"Error conectando a Kafka. Asegúrate de que el contenedor de Kafka está corriendo: {e}")
