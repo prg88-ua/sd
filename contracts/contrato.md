@@ -49,3 +49,47 @@ REGLAS BASICAS DE FUNCIONAMIENTO
 *Una estación no está disponible únicamente por registrarse: su Engine debe estar conectado y responder OK.
 *Una avería durante un riego debe cerrar la válvula.
 
+Ampliación: comunicación mediante Kafka
+
+El contrato anterior se mantiene para sockets: UTF-8, campos separados por "#" y mensajes terminados en "\n".
+
+Kafka transporta objetos JSON codificados en UTF-8. Cada registro de Kafka contiene un objeto completo; no utiliza el delimitador de mensajes de sockets.
+
+Cada petición tiene un "id" único. Sus respuestas, órdenes y eventos conservan ese mismo "id", para no confundir mensajes de riegos diferentes.
+
+Los topics utilizados son:
+
+| Topic         | Emisor → receptor                        | Tipos de mensaje 
+|---------------|------------------------------------------|------------------
+| "fo_requests" | FO o petición local del Engine → CENTRAL | "LIST", "REQUEST" 
+| "fo_responses"| CENTRAL → FO                             | "STATIONS", "PENDING", "ACK", "DENIED", "UPDATE", "END" 
+| "ws_orders"   | CENTRAL → Engine                         | "START", "STOP" 
+| "ws_events"   | Engine → CENTRAL                         | "STARTED", "REJECTED", "TELEMETRY", "END" 
+
+Campos:
+
+- "LIST": "type", "id", "operator".
+- "REQUEST": "type", "id", "operator", "ws", "duration".
+- "START": los campos de REQUEST y "expires", instante de caducidad de la orden.
+- "STOP": "type", "id", "ws", "reason".
+- "STARTED": "type", "id", "ws".
+- "REJECTED": "type", "id", "ws", "reason".
+- "TELEMETRY": "type", "id", "ws", "flow", "volume", "elapsed".
+- "END" del Engine: "type", "id", "ws", "flow", "volume", "elapsed", "reason".
+
+Las respuestas de CENTRAL incluyen "id", "operator" y, cuando corresponde, "ws":
+
+- "STATIONS" añade "stations", lista de estaciones y estados.
+- "PENDING", "ACK" y "DENIED" añaden "reason".
+- "UPDATE" añade "flow", "volume" y "elapsed".
+- "END" añade "volume", "elapsed" y "reason".
+
+"duration" y "elapsed" se expresan en segundos, "flow" en litros/minuto y "volume" en litros de la sesión.
+
+CENTRAL reserva la estación antes de solicitar su arranque. Solo envía "ACK" cuando el Engine confirma "STARTED".
+
+El Engine envía mediciones aproximadamente cada segundo y comunica la finalización, incluyendo las interrupciones. CENTRAL no calcula un final exitoso mediante un temporizador.
+
+Si se pierde la comunicación y no puede obtenerse la medida final, CENTRAL comunica una interrupción identificada como tal y utiliza la última medición recibida.
+
+Cada instancia consume los mensajes y filtra por estación o petición. Al arrancar no ejecuta órdenes antiguas.

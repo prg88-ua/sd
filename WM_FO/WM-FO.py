@@ -1,125 +1,160 @@
+"""Operario: lista estaciones y muestra las mediciones de sus riegos."""
 import argparse
 import time
-import os
-from kafka import KafkaProducer, KafkaConsumer
+import uuid
+
+from wm_common import messages, open_bus, publish
+
+
+def wait_response(consumer, request_id, timeout):
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        for message in messages(consumer):
+            if message.get("id") == request_id:
+                yield message
+
+                # Cada mensaje renueva el plazo de espera.
+                deadline = time.monotonic() + timeout
+
+    raise TimeoutError(
+        "CENTRAL no responde; comprueba sus logs y la conexion"
+    )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="WM_FO - Aplicación de Operario de Campo")
-    parser.add_argument("--kafka-broker", required=True, help="IP y puerto de Kafka (ej: localhost:9092)")
-    parser.add_argument("--id-operario", required=True, help="ID único del operario (ej: FO-01)")
-    
-    # Requisitos del PDF: pedir manualmente o leer de un archivo
-    parser.add_argument("--ws", type=str, help="ID de la estación (para petición manual)", default=None)
-    parser.add_argument("--duracion", type=int, help="Duración del riego en segundos", default=10)
-    parser.add_argument("--archivo", type=str, help="Ruta al fichero de peticiones automáticas", default=None)
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kafka-broker", required=True)
+    parser.add_argument("--id-operario", required=True)
+    parser.add_argument("--ws")
+    parser.add_argument("--duracion", type=int, default=10)
+    parser.add_argument("--archivo")
+    parser.add_argument("--listar", action="store_true")
     args = parser.parse_args()
 
-    if not args.archivo and not args.ws:
-        print("Error: Debes indicar una estación manual (--ws) o un archivo de trabajo (--archivo).")
-        return
+    if not args.listar and not args.ws and not args.archivo:
+        parser.error("Indica --listar, --ws o --archivo")
 
-    print(f"[{args.id_operario}] Iniciando Aplicación de Operario...")
-    
-    # =========================================================
-    # 1. INICIALIZAR KAFKA (Productor y Consumidor)
-    # =========================================================
-    try:
-        # Productor: Habla hacia la Central (Topic: fo_requests)
-        producer = KafkaProducer(
-            bootstrap_servers=[args.kafka_broker],
-            value_serializer=lambda v: str(v).encode('utf-8')
-        )
-        
-        # Consumidor: Escucha las respuestas de la Central (Topic: fo_responses)
-        # Usamos un group_id propio para que este operario escuche solo sus cosas
-        consumer = KafkaConsumer(
-            'fo_responses',
-            bootstrap_servers=[args.kafka_broker],
-            group_id=f'grupo_{args.id_operario}',
-            value_deserializer=lambda x: x.decode('utf-8'),
-            auto_offset_reset='earliest'
-        )
-    except Exception as e:
-        print(f"Error conectando a Kafka. Asegúrate de que el contenedor de Kafka está corriendo: {e}")
-        return
+    tasks = []
 
-    # =========================================================
-    # 2. CARGAR LA LISTA DE TRABAJO
-    # =========================================================
-    peticiones = []
     if args.archivo:
-        if not os.path.exists(args.archivo):
-            print(f"Error: No se encuentra el archivo {args.archivo}")
-            return
-        
-        # Asumimos un archivo de texto donde cada línea es: WS-01,10
-        with open(args.archivo, 'r') as f:
-            for linea in f:
-                if linea.strip():
-                    partes = linea.strip().split(',')
-                    if len(partes) == 2:
-                        peticiones.append((partes[0].strip(), int(partes[1].strip())))
+        with open(args.archivo, encoding="utf-8-sig") as stream:
+            for number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+
+                try:
+                    ws, duration = line.strip().split(",")
+                    tasks.append((ws.strip(), int(duration)))
+
+                except ValueError:
+                    parser.error(
+                        f"Linea {number}: usa WS-01,10"
+                    )
+
     elif args.ws:
-        peticiones.append((args.ws, args.duracion))
+        tasks.append((args.ws, args.duracion))
 
-    print(f"[{args.id_operario}] Lista de trabajo cargada: {len(peticiones)} tareas pendientes.")
+    if any(
+        not ws or not 1 <= duration <= 3600
+        for ws, duration in tasks
+    ):
+        parser.error(
+            "La duracion debe estar entre 1 y 3600 segundos"
+        )
 
-    # =========================================================
-    # 3. PROCESAR PETICIONES (Requisito del PDF)
-    # =========================================================
-    for ws_id, duracion in peticiones:
-        print(f"\n---------------------------------------------------")
-        print(f"[{args.id_operario}] 💧 SOLICITANDO RIEGO EN: {ws_id} (Duración: {duracion}s)")
-        
-        # Mensaje formato: REQUEST#<operario>#<estacion>#<segundos>
-        mensaje_peticion = f"REQUEST#{args.id_operario}#{ws_id}#{duracion}"
-        producer.send('fo_requests', value=mensaje_peticion)
-        producer.flush()
-        
-        print(f"[{args.id_operario}] Petición enviada. Esperando autorización de CENTRAL...")
+    producer, consumer = open_bus(
+        args.kafka_broker, ("fo_responses",)
+    )
 
-        # Bucle de escucha a Kafka
-        riego_en_curso = False
-        riego_finalizado = False
+    try:
+        listing_id = uuid.uuid4().hex
 
-        while not riego_finalizado:
-            # Revisa si hay mensajes nuevos en Kafka
-            mensajes_crudos = consumer.poll(timeout_ms=1000)
-            
-            for topic_partition, mensajes in mensajes_crudos.items():
-                for mensaje in mensajes:
-                    texto = mensaje.value
-                    partes = texto.split("#")
-                    
-                    # Filtramos para asegurarnos de que la respuesta es para nosotros
-                    if len(partes) >= 3 and partes[1] == args.id_operario:
-                        comando = partes[0]
-                        
-                        # Caso A: Central nos autoriza o deniega el arranque
-                        if comando == "ACK":
-                            estado = partes[2]
-                            if estado == "ACEPTADO":
-                                print(f"[{args.id_operario}] ✅ CENTRAL AUTORIZA EL RIEGO en {ws_id}. Válvula abierta.")
-                                riego_en_curso = True
-                            elif estado == "DENEGADO":
-                                motivo = partes[3] if len(partes) > 3 else "Motivo desconocido"
-                                print(f"[{args.id_operario}] ❌ CENTRAL DENIEGA EL RIEGO en {ws_id}. Motivo: {motivo}")
-                                riego_finalizado = True # Fracaso, pasamos a la siguiente
-                                
-                        # Caso B: Central nos manda el ticket final (Conclusión)
-                        elif comando == "END" and riego_en_curso:
-                            volumen = partes[3] if len(partes) > 3 else "0.0"
-                            print(f"[{args.id_operario}] 🏁 RIEGO FINALIZADO en {ws_id}. Volumen consumido: {volumen} Litros.")
-                            riego_finalizado = True # Éxito, pasamos a la siguiente
+        publish(producer, "fo_requests", {
+            "type": "LIST",
+            "id": listing_id,
+            "operator": args.id_operario,
+        })
 
-        # REQUISITO DEL PDF: "tras su conclusión, esperará 4 segundos y pasará a solicitar el siguiente"
-        print(f"[{args.id_operario}] ⏱️ Esperando 4 segundos de seguridad...")
-        time.sleep(4)
+        for message in wait_response(
+            consumer, listing_id, 20
+        ):
+            if message["type"] == "DENIED":
+                print(message["reason"])
+                return
 
-    print(f"\n[{args.id_operario}] Todas las tareas finalizadas con éxito. Cerrando aplicación.")
-    producer.close()
-    consumer.close()
+            if message["type"] == "STATIONS":
+                for ws in message["stations"]:
+                    print(
+                        f"{ws['id']} | {ws['location']} "
+                        f"| {ws['status']}"
+                    )
+
+                break
+
+        for index, (ws, duration) in enumerate(tasks):
+            request_id = uuid.uuid4().hex
+
+            publish(producer, "fo_requests", {
+                "type": "REQUEST",
+                "id": request_id,
+                "operator": args.id_operario,
+                "ws": ws,
+                "duration": duration,
+            })
+
+            print(f"[SOLICITUD] {ws}, {duration}s")
+
+            for message in wait_response(
+                consumer, request_id, 20
+            ):
+                kind = message["type"]
+
+                if kind == "PENDING":
+                    print(
+                        "CENTRAL comprueba el arranque con el Engine..."
+                    )
+
+                elif kind == "ACK":
+                    print(
+                        "Riego iniciado y confirmado por el Engine"
+                    )
+
+                elif kind == "UPDATE":
+                    print(
+                        f"{message['elapsed']:.1f}s | "
+                        f"{message['flow']:.1f} L/min | "
+                        f"{message['volume']:.2f} L"
+                    )
+
+                elif kind == "DENIED":
+                    print(
+                        f"DENEGADO: {message['reason']}"
+                    )
+                    break
+
+                elif kind == "END":
+                    print(
+                        f"FIN: {message['reason']} | "
+                        f"{message['elapsed']:.1f}s | "
+                        f"{message['volume']:.2f} L"
+                    )
+                    break
+
+            if index + 1 < len(tasks):
+                print(
+                    "Esperando 4 segundos para "
+                    "la siguiente peticion..."
+                )
+                time.sleep(4)
+
+    except (TimeoutError, KeyboardInterrupt) as error:
+        print(f"[FO] {error}")
+
+    finally:
+        consumer.close()
+        producer.close()
+
 
 if __name__ == "__main__":
     main()

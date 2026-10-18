@@ -19,7 +19,28 @@
         <div class="flex justify-between items-center mb-6">
             <h1 class="text-3xl font-bold text-blue-400">Panel de Control: Water Management</h1>
         </div>
-        
+        <div class="flex gap-3 mb-6">
+            <button
+                onclick="stationAction('ALL', 'start')"
+                class="bg-blue-600 px-4 py-2 rounded"
+            >
+                Regar disponibles
+            </button>
+
+            <button
+                onclick="stationAction('ALL', 'block')"
+                class="bg-orange-600 px-4 py-2 rounded"
+            >
+                Bloquear todas
+            </button>
+
+            <button
+                onclick="stationAction('ALL', 'activate')"
+                class="bg-green-600 px-4 py-2 rounded"
+            >
+                Activar todas
+            </button>
+        </div>
         <!-- Tarjetas de Resumen -->
         <div class="grid grid-cols-5 gap-4 mb-6" id="summary-cards">
             <!-- JS inyectará aquí los contadores -->
@@ -52,10 +73,41 @@
         // Función para ejecutar acciones individuales sobre una estación
         async function stationAction(wsId, action) {
             try {
-                await fetch(`/api/stations/${wsId}/${action}`, { method: 'POST' });
-                fetchStations();
+                const options = { method: 'POST' };
+
+                if (action === 'start') {
+                    const answer = prompt('Duración del riego en segundos:', '10');
+
+                    if (answer === null) {
+                        return;
+                    }
+
+                    const duration = Number(answer);
+
+                    if (!Number.isInteger(duration) || duration < 1 || duration > 3600) {
+                        alert('Introduce un número entero entre 1 y 3600.');
+                        return;
+                    }
+
+                    options.headers = { 'Content-Type': 'application/json' };
+                    options.body = JSON.stringify({ duration });
+                }
+
+                const response = await fetch(
+                    `/api/stations/${encodeURIComponent(wsId)}/${action}`,
+                    options
+                );
+
+                const result = await response.json();
+
+                if (!response.ok) {
+                    alert(result.error || 'No se pudo tramitar la acción.');
+                }
+
+                await fetchStations();
             } catch (error) {
-                console.error(`Error al ejecutar ${action} en ${wsId}:`, error);
+                alert('No se pudo contactar con CENTRAL.');
+                console.error(error);
             }
         }
 

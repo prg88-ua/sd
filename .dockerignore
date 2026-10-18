@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+.venv
+**/.venv
+**/__pycache__
+*.pyc
+**/*.pyc
+*.db
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm

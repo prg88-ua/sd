@@ -1,353 +1,227 @@
-"""
-WM_WS_M.py — Monitor de Estación de Riego
-Actúa como puente permanente entre Central y Engine.
-
-Flujo de hilos:
-  Main        : conecta a Central, envía REGISTRO, se queda leyendo respuestas
-  engine_srv  : abre servidor TCP en --monitor-port esperando al Engine
-  ping_loop   : cada 1s envía PING#<n> al Engine y recoge PONG#<n>#OK|KO
-  health_loop : cada 1s envía HEALTH#<ws_id>#OK|KO a Central
-"""
-
+"""Monitor: conserva los mensajes de sockets definidos en el contrato."""
 import argparse
 import socket
 import threading
 import time
 
-FORMAT = "utf-8"
-MAX_MESSAGE_BYTES = 4096
-HEALTH_INTERVAL = 1.0   # segundos entre latidos a Central
-PING_INTERVAL   = 1.0   # segundos entre pings al Engine
-PING_TIMEOUT    = 2.0   # espera máxima para recibir el PONG
-
-# ─────────────────────────────────────────────
-# Utilidades de envío / recepción
-# ─────────────────────────────────────────────
-
-def send_msg(sock, text):
-    """Envía un mensaje terminado en \\n."""
-    sock.sendall((text + "\n").encode(FORMAT))
+from wm_common import LineReader, field, send_line
 
 
-def recv_line(sock, timeout=None):
-    """
-    Lee del socket hasta el primer \\n y devuelve la línea limpia.
-    Levanta socket.timeout si no llega nada en `timeout` segundos.
-    Levanta ConnectionError si el socket se cierra.
-    """
-    old_timeout = sock.gettimeout()
-    if timeout is not None:
-        sock.settimeout(timeout)
-    try:
-        buf = b""
-        while True:
-            chunk = sock.recv(1024)
-            if not chunk:
-                raise ConnectionError("Socket cerrado por el otro extremo.")
-            buf += chunk
-            if b"\n" in buf:
-                line, _ = buf.split(b"\n", 1)
-                if len(line) > MAX_MESSAGE_BYTES:
-                    raise ValueError("Línea demasiado larga.")
-                return line.decode(FORMAT)
-    finally:
-        sock.settimeout(old_timeout)
-
-
-# ─────────────────────────────────────────────
-# Estado compartido entre hilos
-# ─────────────────────────────────────────────
-
-class MonitorState:
-    def __init__(self):
+class Monitor:
+    def __init__(self, args):
+        self.args = args
         self.lock = threading.Lock()
+        self.registered = threading.Event()
+        self.engine = None
+        self.last_ok = 0.0
 
-        # Referencia al socket del Engine (None si no está conectado)
-        self._engine_sock = None
-
-        # True  → Engine respondió OK en el último PONG
-        # False → Engine respondió KO, no respondió o se cayó
-        self._engine_ok = False
-
-        # Señal de parada global para todos los hilos
-        self._stop = threading.Event()
-
-    # ── Engine socket ────────────────────────
-    @property
-    def engine_sock(self):
+    def healthy(self):
         with self.lock:
-            return self._engine_sock
+            return (
+                self.engine is not None
+                and time.monotonic() - self.last_ok < 3
+            )
 
-    @engine_sock.setter
-    def engine_sock(self, s):
-        with self.lock:
-            self._engine_sock = s
+    def engine_session(self, sock):
+        reader = LineReader(sock)
 
-    # ── engine_ok ───────────────────────────
-    @property
-    def engine_ok(self):
-        with self.lock:
-            return self._engine_ok
-
-    @engine_ok.setter
-    def engine_ok(self, v):
-        with self.lock:
-            self._engine_ok = v
-
-    # ── stop ────────────────────────────────
-    def request_stop(self):
-        self._stop.set()
-
-    def should_stop(self):
-        return self._stop.is_set()
-
-
-# ─────────────────────────────────────────────
-# Hilo: servidor TCP para el Engine
-# ─────────────────────────────────────────────
-
-def engine_server_thread(monitor_port, ws_id, state):
-    """
-    Abre un servidor TCP en monitor_port.
-    Cuando el Engine conecta, responde a IDENTIFY con IDENTITY#<ws_id>
-    y guarda el socket en state.engine_sock.
-    Acepta reconexiones: si el Engine se cae y vuelve, lo registra de nuevo.
-    """
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", monitor_port))
-    srv.listen(1)
-    srv.settimeout(1.0)   # para poder comprobar should_stop periódicamente
-    print(f"[ENGINE-SRV] Escuchando al Engine en puerto {monitor_port}")
-
-    while not state.should_stop():
         try:
-            conn, addr = srv.accept()
-        except socket.timeout:
-            continue
-        except OSError:
-            break
+            if reader.read() != "IDENTIFY":
+                send_line(sock, "STATUS#ERROR#INVALID_MESSAGE")
+                return
 
-        print(f"[ENGINE-SRV] Engine conectado desde {addr}")
+            if not self.registered.is_set():
+                send_line(sock, "STATUS#ERROR#NOT_REGISTERED")
+                return
 
-        # Protocolo: Engine envía IDENTIFY → respondemos IDENTITY#<ws_id>
-        try:
-            msg = recv_line(conn, timeout=5.0)
-            if msg.strip() == "IDENTIFY":
-                send_msg(conn, f"IDENTITY#{ws_id}")
-                print(f"[ENGINE-SRV] Identidad enviada al Engine: {ws_id}")
-                # Guardamos el socket; el ping_loop lo usará
-                state.engine_sock = conn
-                state.engine_ok   = True   # optimista hasta el primer PONG
-            else:
-                print(f"[ENGINE-SRV] Mensaje inesperado del Engine: {msg!r}")
-                conn.close()
-        except Exception as e:
-            print(f"[ENGINE-SRV] Error en handshake con Engine: {e}")
-            conn.close()
+            with self.lock:
+                if self.engine is not None:
+                    send_line(sock, "STATUS#ERROR#DUPLICATE_ENGINE")
+                    return
 
-    srv.close()
-    print("[ENGINE-SRV] Servidor de Engine cerrado.")
+                self.engine = sock
 
+                # Identificarse no demuestra que el Engine este sano.
+                self.last_ok = 0
 
-# ─────────────────────────────────────────────
-# Hilo: bucle PING → Engine
-# ─────────────────────────────────────────────
+            send_line(sock, f"IDENTITY#{self.args.ws_id}")
+            seq = 0
 
-def ping_loop_thread(ws_id, state):
-    """
-    Cada PING_INTERVAL segundos envía PING#<n> al Engine y espera PONG#<n>#OK|KO.
-    Actualiza state.engine_ok según la respuesta.
-    """
-    seq = 0
-    while not state.should_stop():
-        time.sleep(PING_INTERVAL)
+            while True:
+                with self.lock:
+                    if self.engine is not sock:
+                        break
 
-        sock = state.engine_sock
-        if sock is None:
-            # Aún no ha conectado ningún Engine
-            state.engine_ok = False
-            continue
+                if not self.registered.is_set():
+                    with self.lock:
+                        self.last_ok = 0
 
-        seq += 1
-        try:
-            send_msg(sock, f"PING#{seq}")
-            response = recv_line(sock, timeout=PING_TIMEOUT)
+                    time.sleep(0.2)
+                    continue
 
-            # Esperamos PONG#<seq>#OK o PONG#<seq>#KO
-            parts = response.strip().split("#")
-            if len(parts) == 3 and parts[0] == "PONG" and parts[1] == str(seq):
-                new_ok = (parts[2] == "OK")
-                if state.engine_ok != new_ok:
-                    estado = "OK ✓" if new_ok else "KO ✗"
-                    print(f"[PING] Engine cambió a {estado}")
-                state.engine_ok = new_ok
-            else:
-                print(f"[PING] Respuesta inesperada al PING#{seq}: {response!r}")
-                state.engine_ok = False
+                started = time.monotonic()
+                seq += 1
+                send_line(sock, f"PING#{seq}")
 
-        except socket.timeout:
-            print(f"[PING] Timeout esperando PONG#{seq} → Engine KO")
-            state.engine_ok = False
-            # No cerramos el socket; quizás el Engine solo estaba lento.
+                deadline = started + 2
+                ok = False
 
-        except (ConnectionError, OSError) as e:
-            print(f"[PING] Socket del Engine caído: {e}")
-            state.engine_ok = False
-            state.engine_sock = None   # el engine_server_thread aceptará uno nuevo
+                while time.monotonic() < deadline:
+                    try:
+                        parts = reader.read(
+                            max(0.01, deadline - time.monotonic())
+                        ).split("#")
 
+                    except socket.timeout:
+                        break
 
-# ─────────────────────────────────────────────
-# Hilo: bucle HEALTH → Central
-# ─────────────────────────────────────────────
+                    if (
+                        len(parts) == 3
+                        and parts[:2] == ["PONG", str(seq)]
+                        and parts[2] in ("OK", "KO")
+                    ):
+                        ok = parts[2] == "OK"
+                        break
 
-def health_loop_thread(ws_id, central_sock, state):
-    """
-    Cada HEALTH_INTERVAL segundos envía HEALTH#<ws_id>#OK|KO a Central.
-    """
-    while not state.should_stop():
-        time.sleep(HEALTH_INTERVAL)
+                    # Un PONG atrasado no vale para el PING actual.
 
-        codigo = "OK" if state.engine_ok else "KO"
-        msg    = f"HEALTH#{ws_id}#{codigo}"
-        try:
-            send_msg(central_sock, msg)
-        except OSError as e:
-            print(f"[HEALTH] No se pudo enviar latido a Central: {e}")
-            state.request_stop()   # si perdemos Central, salimos
-            break
+                with self.lock:
+                    self.last_ok = time.monotonic() if ok else 0
 
+                time.sleep(
+                    max(0, 1 - (time.monotonic() - started))
+                )
 
-# ─────────────────────────────────────────────
-# Lectura de respuestas de Central (hilo main)
-# ─────────────────────────────────────────────
+        except (OSError, ValueError, ConnectionError) as error:
+            print(f"[ENGINE] {error}", flush=True)
 
-def read_central_loop(central_sock, ws_id, state):
-    """
-    Lee cualquier mensaje que Central envíe de vuelta.
-    Por ahora solo imprime (STATUS#OK#HEALTH_RECEIVED, etc.).
-    """
-    central_sock.settimeout(None)   # bloqueante
-    try:
-        while not state.should_stop():
+        finally:
+            with self.lock:
+                if self.engine is sock:
+                    self.engine = None
+                    self.last_ok = 0
+
+            sock.close()
+
+    def engine_server(self):
+        with socket.socket() as server:
+            server.setsockopt(
+                socket.SOL_SOCKET, socket.SO_REUSEADDR, 1
+            )
+
+            server.bind(("0.0.0.0", self.args.monitor_port))
+            server.listen()
+
+            while True:
+                sock, _ = server.accept()
+
+                threading.Thread(
+                    target=self.engine_session,
+                    args=(sock,),
+                    daemon=True,
+                ).start()
+
+    def run(self):
+        threading.Thread(
+            target=self.engine_server, daemon=True
+        ).start()
+
+        while True:
             try:
-                line = recv_line(central_sock, timeout=10.0)
-                print(f"[CENTRAL] {line}")
-            except socket.timeout:
-                continue  # nada recibido, seguimos
-    except (ConnectionError, OSError) as e:
-        if not state.should_stop():
-            print(f"[CENTRAL] Conexión perdida: {e}")
-            state.request_stop()
+                with socket.create_connection(
+                    (
+                        self.args.central_host,
+                        self.args.central_port,
+                    ),
+                    timeout=5,
+                ) as sock:
+                    reader = LineReader(sock)
+
+                    send_line(
+                        sock,
+                        f"REGISTRO#{self.args.ws_id}#{self.args.location}",
+                    )
+
+                    if reader.read() != "STATUS#OK#REGISTERED":
+                        raise ValueError(
+                            "Registro rechazado por CENTRAL"
+                        )
+
+                    self.registered.set()
+                    print("[CENTRAL] Registro aceptado", flush=True)
+
+                    while True:
+                        started = time.monotonic()
+                        code = "OK" if self.healthy() else "KO"
+
+                        send_line(
+                            sock,
+                            f"HEALTH#{self.args.ws_id}#{code}",
+                        )
+
+                        if reader.read() != "STATUS#OK#HEALTH_RECEIVED":
+                            raise ValueError(
+                                "Respuesta HEALTH incorrecta"
+                            )
+
+                        print(f"[SALUD] {code}", flush=True)
+
+                        time.sleep(
+                            max(0, 1 - (time.monotonic() - started))
+                        )
+
+            except (OSError, ValueError, ConnectionError) as error:
+                print(
+                    f"[CENTRAL] Reconectando: {error}",
+                    flush=True,
+                )
+
+            finally:
+                self.registered.clear()
+
+                # Al perder CENTRAL, forzamos al Engine a cerrar el riego.
+                # Despues podra reconectarse y volver a identificarse.
+                with self.lock:
+                    engine = self.engine
+                    self.engine = None
+                    self.last_ok = 0
+
+                if engine is not None:
+                    try:
+                        engine.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+                    engine.close()
+
+            time.sleep(2)
 
 
-# ─────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--central-host", required=True)
+    parser.add_argument("--central-port", type=int, required=True)
+    parser.add_argument("--monitor-port", type=int, required=True)
+    parser.add_argument("--ws-id", required=True)
+    parser.add_argument("--location", required=True)
+    args = parser.parse_args()
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description="WM_WS_M: Monitor de Estación de Riego."
-    )
-    p.add_argument("--central-host",  required=True,  help="IP/host de Central")
-    p.add_argument("--central-port",  type=int, required=True,  help="Puerto socket de Central")
-    p.add_argument("--monitor-port",  type=int, required=True,  help="Puerto TCP que abre el Monitor para el Engine")
-    p.add_argument("--ws-id",         required=True,  help="ID de la estación (ej: WS-01)")
-    p.add_argument("--location",      required=True,  help="Ubicación (ej: Parque Central)")
-    args = p.parse_args(argv)
-
-    # Validaciones básicas
-    for name, value in [("--ws-id", args.ws_id), ("--location", args.location)]:
-        if not value.strip():
-            p.error(f"{name} no puede estar vacío.")
-        if any(c in value for c in ("#", "\n", "\r", "\x00")):
-            p.error(f"{name} contiene un carácter no permitido.")
-
-    if not 1 <= args.central_port <= 65535:
-        p.error("--central-port fuera de rango.")
-    if not 1 <= args.monitor_port <= 65535:
-        p.error("--monitor-port fuera de rango.")
-
-    return args
-
-
-def main(argv=None):
-    args  = parse_args(argv)
-    state = MonitorState()
-
-    # ── 1. Conectar a Central ────────────────
-    print(f"[MAIN] Conectando a Central {args.central_host}:{args.central_port}…")
-    try:
-        central_sock = socket.create_connection(
-            (args.central_host, args.central_port), timeout=10.0
+    if not field(args.ws_id) or not field(args.location):
+        parser.error(
+            "ID y ubicacion no pueden contener # ni saltos de linea"
         )
-    except OSError as e:
-        print(f"[ERROR] No se pudo conectar a Central: {e}")
-        return 1
 
-    # ── 2. Registro ──────────────────────────
-    registro = f"REGISTRO#{args.ws_id}#{args.location}"
+    if not all(
+        1 <= p <= 65535
+        for p in (args.central_port, args.monitor_port)
+    ):
+        parser.error("Puertos fuera de rango")
+
     try:
-        send_msg(central_sock, registro)
-        print(f"[MAIN] Enviado: {registro}")
-
-        respuesta = recv_line(central_sock, timeout=10.0)
-        print(f"[MAIN] Recibido: {respuesta}")
-
-        partes = respuesta.strip().split("#")
-        if not (len(partes) == 3 and partes[0] == "STATUS" and partes[1] == "OK"):
-            print(f"[ERROR] Registro rechazado: {respuesta}")
-            central_sock.close()
-            return 1
-
-        print(f"[MAIN] ✔ Estación {args.ws_id} registrada en Central.")
-
-    except Exception as e:
-        print(f"[ERROR] Durante el registro: {e}")
-        central_sock.close()
-        return 1
-
-    # ── 3. Lanzar hilos ──────────────────────
-    hilos = [
-        threading.Thread(
-            target=engine_server_thread,
-            args=(args.monitor_port, args.ws_id, state),
-            name="engine-srv", daemon=True
-        ),
-        threading.Thread(
-            target=ping_loop_thread,
-            args=(args.ws_id, state),
-            name="ping-loop", daemon=True
-        ),
-        threading.Thread(
-            target=health_loop_thread,
-            args=(args.ws_id, central_sock, state),
-            name="health-loop", daemon=True
-        ),
-        threading.Thread(
-            target=read_central_loop,
-            args=(central_sock, args.ws_id, state),
-            name="central-reader", daemon=True
-        ),
-    ]
-
-    for h in hilos:
-        h.start()
-
-    print("[MAIN] Monitor en marcha. Ctrl+C para detener.")
-
-    # ── 4. Esperar señal de parada ───────────
-    try:
-        while not state.should_stop():
-            time.sleep(0.5)
+        Monitor(args).run()
     except KeyboardInterrupt:
-        print("\n[MAIN] Interrupción de teclado, cerrando…")
-
-    state.request_stop()
-    central_sock.close()
-    print("[MAIN] Monitor detenido.")
-    return 0
+        print("Monitor detenido")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
