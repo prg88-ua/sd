@@ -16,24 +16,32 @@ Este paso levanta la Central, la base de datos SQLite y el broker de Kafka. Solo
 
 1. Conéctate a tu instancia EC2 (por SSH o desde la consola web EC2 Instance Connect).
 2. Clona el repositorio y entra en la carpeta:
-   git clone https://github.com//prg88-ua/sd.git
+   ```bash
+   git clone https://github.com/prg88-ua/sd.git
    cd sd
+   ```
 
 3. Exporta la IP pública de tu máquina EC2 para que Kafka la registre correctamente y levanta los servicios en segundo plano:
+   ```bash
    export KAFKA_PUBLIC_HOST=<IP_PUBLICA_AWS>
    docker compose up -d
+   ```
 
 4. *(Opcional)* Verifica que todo está funcionando correctamente:
+   ```bash
    docker compose logs -f
+   ```
 
 ---
 
 ## 2. Preparación en los PCs del Laboratorio
 En ambos ordenadores del laboratorio (PC 1 y PC 2), abre una terminal, clona el repositorio y construye la imagen base de Docker:
 
-git clone https://github.com//prg88-ua/sd.git
+```bash
+git clone https://github.com/prg88-ua/sd.git
 cd sd
 docker build -t water-management:local .
+```
 
 ---
 
@@ -42,6 +50,7 @@ Por cada estación que el profesor pida levantar (ej. `WS-01`), abre **dos termi
 *(Nota: Si usaste guiones medios en los nombres de archivo como `WM_WS-E.py`, ajusta el nombre en el comando).*
 
 **Terminal 1 (Lanzar el Monitor):**
+```bash
 docker run -it --rm --network host water-management:local \
   python WM_WS/WM_WS_M/WM_WS_M.py \
   --central-host <IP_PUBLICA_AWS> \
@@ -49,13 +58,16 @@ docker run -it --rm --network host water-management:local \
   --monitor-port 7001 \
   --ws-id WS-01 \
   --location "Parque_Central"
+```
 
 **Terminal 2 (Lanzar el Engine):**
+```bash
 docker run -it --rm --network host water-management:local \
   python WM_WS/WM_WS_E/WM_WS_E.py \
   --monitor-host 127.0.0.1 \
   --monitor-port 7001 \
   --kafka-broker <IP_PUBLICA_AWS>:9092
+```
 *(Para levantar una segunda estación `WS-02`, abre otras dos terminales y cambia `--ws-id WS-02` y `--monitor-port 7002`).*
 
 ---
@@ -64,26 +76,32 @@ docker run -it --rm --network host water-management:local \
 En el otro ordenador del laboratorio, lanza la aplicación del operario. Tienes varias opciones según lo que te pida el profesor:
 
 **Opción A: Ejecutar riegos automáticos desde fichero**
+```bash
 docker run -it --rm --network host -v $(pwd)/peticiones.txt:/app/peticiones.txt:ro water-management:local \
   python WM_FO/WM_FO.py \
   --kafka-broker <IP_PUBLICA_AWS>:9092 \
   --id-operario FO-01 \
   --archivo peticiones.txt
+```
 
 **Opción B: Pedir un riego puntual manual**
+```bash
 docker run -it --rm --network host water-management:local \
   python WM_FO/WM_FO.py \
   --kafka-broker <IP_PUBLICA_AWS>:9092 \
   --id-operario FO-02 \
   --ws WS-01 \
   --duracion 15
+```
 
 **Opción C: Solo listar estaciones**
+```bash
 docker run -it --rm --network host water-management:local \
   python WM_FO/WM_FO.py \
   --kafka-broker <IP_PUBLICA_AWS>:9092 \
   --id-operario FO-03 \
   --listar
+```
 
 ---
 
