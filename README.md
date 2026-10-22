@@ -17,3 +17,7 @@ function Riego {
 
     docker run --rm -it water-management:local python WM_FO/WM-FO.py --kafka-broker 54.216.189.86:9092 --id-operario $Operario --ws $Estacion --duracion $Segundos
 }
+
+
+
+docker run --rm -it water-management:local python WM_FO/WM-FO.py --kafka-broker 54.216.189.86:9092 --id-operario FO-01 --listar
