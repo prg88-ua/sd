@@ -53,7 +53,7 @@ Por cada estación que el profesor pida levantar (ej. `WS-01`), abre **dos termi
 ```bash
 docker run -it --rm --network host water-management:local \
   python WM_WS/WM_WS_M/WM_WS_M.py \
-  --central-host <IP_PUBLICA_AWS> \
+  --central-host 54.216.189.86 \
   --central-port 6000 \
   --monitor-port 7001 \
   --ws-id WS-01 \
@@ -66,7 +66,7 @@ docker run -it --rm --network host water-management:local \
   python WM_WS/WM_WS_E/WM_WS_E.py \
   --monitor-host 127.0.0.1 \
   --monitor-port 7001 \
-  --kafka-broker <IP_PUBLICA_AWS>:9092
+  --kafka-broker 54.216.189.86:9092
 ```
 *(Para levantar una segunda estación `WS-02`, abre otras dos terminales y cambia `--ws-id WS-02` y `--monitor-port 7002`).*
 
