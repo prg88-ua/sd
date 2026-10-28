@@ -1,4 +1,4 @@
-"""Operario: lista estaciones, recupera ordenes previas y muestra mediciones."""
+"""Operario (WM_FO): interfaz interactiva por menú, persistencia y seguimiento de riegos."""
 import argparse
 import json
 import os
@@ -50,239 +50,246 @@ def wait_response(consumer, request_id, timeout):
         for message in messages(consumer):
             if message.get("id") == request_id:
                 yield message
-
-                # Cada mensaje renueva el plazo de espera.
+                # Cada mensaje renueva el plazo de espera
                 deadline = time.monotonic() + timeout
 
-    raise TimeoutError(
-        "CENTRAL no responde; comprueba sus logs y la conexion"
-    )
+    raise TimeoutError("CENTRAL no responde; comprueba sus logs y la conexión")
+
+
+def get_stations(producer, consumer, operator_id):
+    """Consulta la lista de estaciones disponibles y comprueba la validez del operario."""
+    listing_id = uuid.uuid4().hex
+    publish(producer, "fo_requests", {
+        "type": "LIST",
+        "id": listing_id,
+        "operator": operator_id,
+    })
+
+    for message in wait_response(consumer, listing_id, 20):
+        if message["type"] == "DENIED":
+            reason = message.get("reason", "DESCONOCIDO")
+            if reason == "OPERARIO_NO_REGISTRADO":
+                raise ValueError(
+                    f"Excepción: El operario '{operator_id}' no existe en el sistema."
+                )
+            raise ValueError(
+                f"Excepción: Petición de operario denegada por CENTRAL ({reason})"
+            )
+
+        if message["type"] == "STATIONS":
+            return (
+                message.get("stations", []),
+                message.get("active_order"),
+                message.get("last_completed"),
+            )
+
+    return [], None, None
+
+
+def execute_irrigation(producer, consumer, operator_id, ws, duration, known_stations):
+    """Ejecuta una solicitud de riego individual y muestra la telemetría en tiempo real."""
+    valid_ids = {s["id"] for s in known_stations}
+    if ws not in valid_ids:
+        raise ValueError(f"Excepción: La estación de riego '{ws}' no existe en el sistema.")
+
+    if not (1 <= duration <= 3600):
+        raise ValueError("La duración debe estar entre 1 y 3600 segundos.")
+
+    request_id = uuid.uuid4().hex
+
+    save_fo_state(operator_id, {
+        "id": request_id,
+        "ws": ws,
+        "duration": duration,
+        "operator": operator_id,
+        "time": time.time(),
+    })
+
+    publish(producer, "fo_requests", {
+        "type": "REQUEST",
+        "id": request_id,
+        "operator": operator_id,
+        "ws": ws,
+        "duration": duration,
+    })
+
+    print(f"\n[SOLICITUD ENVIADA] Estación: {ws} | Duración: {duration}s")
+
+    for message in wait_response(consumer, request_id, 25):
+        kind = message["type"]
+
+        if kind == "PENDING":
+            print("[ESTADO] CENTRAL comprobando el arranque con el Engine...")
+
+        elif kind == "ACK":
+            print("[ESTADO] Riego iniciado y confirmado por el Engine.")
+
+        elif kind == "UPDATE":
+            print(
+                f"[RIEGO EN CURSO] Tiempo: {message['elapsed']:.1f}s | "
+                f"Caudal: {message['flow']:.1f} L/min | "
+                f"Volumen: {message['volume']:.2f} L"
+            )
+
+        elif kind == "DENIED":
+            clear_fo_state(operator_id)
+            reason = message.get("reason", "DESCONOCIDO")
+            if reason == "ESTACION_NO_EXISTE":
+                raise ValueError(f"Excepción: La estación '{ws}' no existe en el sistema.")
+            elif reason == "OPERARIO_NO_REGISTRADO":
+                raise ValueError(f"Excepción: El operario '{operator_id}' no existe en el sistema.")
+            else:
+                print(f"[DENEGADO] {reason}")
+            break
+
+        elif kind == "END":
+            clear_fo_state(operator_id)
+            print(
+                f"\n[FIN DE RIEGO] Motivo: {message['reason']} | "
+                f"Tiempo total: {message['elapsed']:.1f}s | "
+                f"Volumen total: {message['volume']:.2f} L\n"
+            )
+            break
+
+
+def check_recovery(producer, consumer, operator_id, active_order, last_completed):
+    """Comprueba si el operario se cerró durante un riego previo y muestra el resultado."""
+    saved_state = load_fo_state(operator_id)
+
+    if active_order:
+        act_id = active_order["id"]
+        act_ws = active_order["ws"]
+        print(
+            f"\n>>> [RECUPERACIÓN] Detectado riego previo aún en curso en {act_ws} "
+            f"(ID={act_id}). Reanudando seguimiento...",
+            flush=True,
+        )
+
+        for msg in wait_response(consumer, act_id, 25):
+            k = msg["type"]
+            if k == "UPDATE":
+                print(
+                    f"[RIEGO] {msg['elapsed']:.1f}s | "
+                    f"{msg['flow']:.1f} L/min | "
+                    f"{msg['volume']:.2f} L"
+                )
+            elif k == "END":
+                print(
+                    f"\n>>> [FIN RIEGO PREVIO] {msg['reason']} | "
+                    f"Tiempo: {msg['elapsed']:.1f}s | "
+                    f"Volumen: {msg['volume']:.2f} L\n"
+                )
+                clear_fo_state(operator_id)
+                break
+            elif k == "DENIED":
+                print(f"\n>>> [DENEGADO RIEGO PREVIO] {msg['reason']}\n")
+                clear_fo_state(operator_id)
+                break
+
+    elif last_completed and (
+        (saved_state and saved_state.get("id") == last_completed.get("id"))
+        or (time.time() - last_completed.get("timestamp", 0) < 300)
+    ):
+        print(
+            f"\n>>> [RECUPERACIÓN] El servicio solicitado antes de cerrarse ya finalizó:\n"
+            f"    Estación: {last_completed.get('ws')} | "
+            f"Motivo: {last_completed['reason']} | "
+            f"Tiempo: {last_completed['elapsed']:.1f}s | "
+            f"Volumen: {last_completed['volume']:.2f} L\n",
+            flush=True,
+        )
+        clear_fo_state(operator_id)
+
+    elif saved_state:
+        clear_fo_state(operator_id)
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--kafka-broker", required=True)
-    parser.add_argument("--id-operario", required=True)
-    parser.add_argument("--ws")
-    parser.add_argument("--duracion", type=int, default=10)
-    parser.add_argument("--archivo")
-    parser.add_argument("--listar", action="store_true")
+    parser = argparse.ArgumentParser(description="Aplicación del Operario de Campo (WM_FO)")
+    parser.add_argument("--kafka-broker", required=True, help="Host y puerto de Kafka (ej. localhost:9092)")
+    parser.add_argument("--id-operario", required=True, help="Identificador del operario (ej. FO-01)")
     args = parser.parse_args()
 
-    tasks = []
-
-    if args.archivo:
-        with open(args.archivo, encoding="utf-8-sig") as stream:
-            for number, line in enumerate(stream, 1):
-                if not line.strip():
-                    continue
-
-                try:
-                    ws, duration = line.strip().split(",")
-                    tasks.append((ws.strip(), int(duration)))
-
-                except ValueError:
-                    parser.error(
-                        f"Linea {number}: usa WS-01,10"
-                    )
-
-    elif args.ws:
-        tasks.append((args.ws, args.duracion))
-
-    if tasks and any(
-        not ws or not 1 <= duration <= 3600
-        for ws, duration in tasks
-    ):
-        parser.error(
-            "La duracion debe estar entre 1 y 3600 segundos"
-        )
-
-    producer, consumer = open_bus(
-        args.kafka_broker, ("fo_responses",)
-    )
+    producer, consumer = open_bus(args.kafka_broker, ("fo_responses",))
 
     try:
-        listing_id = uuid.uuid4().hex
+        # 1. Autenticar operario y verificar estado previo
+        stations, active_order, last_completed = get_stations(producer, consumer, args.id_operario)
+        check_recovery(producer, consumer, args.id_operario, active_order, last_completed)
 
-        publish(producer, "fo_requests", {
-            "type": "LIST",
-            "id": listing_id,
-            "operator": args.id_operario,
-        })
+        # 2. Bucle principal del Menú Interactivo
+        while True:
+            print("\n" + "=" * 45)
+            print(f"      PANEL OPERARIO: {args.id_operario}")
+            print("=" * 45)
+            print("  1. Listar estaciones de riego y estado")
+            print("  2. Solicitar un riego (manual)")
+            print("  3. Ejecutar riegos desde archivo")
+            print("  4. Salir")
+            print("=" * 45)
 
-        stations = []
-        active_order = None
-        last_completed = None
-
-        for message in wait_response(
-            consumer, listing_id, 20
-        ):
-            if message["type"] == "DENIED":
-                reason = message.get("reason", "DESCONOCIDO")
-                if reason == "OPERARIO_NO_REGISTRADO":
-                    raise ValueError(
-                        f"Excepción: El operario '{args.id_operario}' no existe en el sistema."
-                    )
-                raise ValueError(
-                    f"Excepción: Petición de operario denegada por CENTRAL ({reason})"
-                )
-
-            if message["type"] == "STATIONS":
-                stations = message.get("stations", [])
-                active_order = message.get("active_order")
-                last_completed = message.get("last_completed")
-
-                print(f"--- Estaciones disponibles para operario {args.id_operario} ---")
-                for ws in stations:
-                    print(
-                        f"{ws['id']} | {ws['location']} "
-                        f"| {ws['status']}"
-                    )
-
+            try:
+                opcion = input("Seleccione una opción [1-4]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSaliendo del panel...")
                 break
 
-        # Validar existencia de las estaciones solicitadas
-        valid_station_ids = {ws["id"] for ws in stations}
-        for ws, _ in tasks:
-            if ws not in valid_station_ids:
-                raise ValueError(
-                    f"Excepción: La estación de riego '{ws}' no existe en el sistema."
-                )
+            if opcion == "1":
+                stations, _, _ = get_stations(producer, consumer, args.id_operario)
+                print("\n--- ESTACIONES REGISTRADAS EN CENTRAL ---")
+                for s in stations:
+                    print(f"  • {s['id']} | {s['location']} | Estado: {s['status']}")
+                print("-" * 42)
 
-        # Requisito de Resiliencia: si el operario se cerro mientras se prestaba un servicio,
-        # al reabrir el operario ve el resultado del servicio que habia pedido antes de caerse.
-        saved_state = load_fo_state(args.id_operario)
-        recovered_ws = None
+            elif opcion == "2":
+                stations, _, _ = get_stations(producer, consumer, args.id_operario)
+                valid_ids = [s["id"] for s in stations]
+                print(f"Estaciones disponibles: {', '.join(valid_ids) if valid_ids else 'Ninguna'}")
 
-        if active_order:
-            act_id = active_order["id"]
-            act_ws = active_order["ws"]
-            recovered_ws = act_ws
-            print(
-                f"\n[RECUPERACION] Detectada orden previa aún en curso en {act_ws} "
-                f"(ID={act_id}). Reanudando seguimiento...",
-                flush=True,
-            )
+                ws_id = input("Introduce ID de la estación (ej. WS-01): ").strip()
+                dur_str = input("Introduce la duración en segundos [10]: ").strip() or "10"
 
-            for msg in wait_response(consumer, act_id, 25):
-                k = msg["type"]
-                if k == "UPDATE":
-                    print(
-                        f"{msg['elapsed']:.1f}s | "
-                        f"{msg['flow']:.1f} L/min | "
-                        f"{msg['volume']:.2f} L"
-                    )
-                elif k == "END":
-                    print(
-                        f"\n[FIN RIEGO PREVIO] {msg['reason']} | "
-                        f"{msg['elapsed']:.1f}s | "
-                        f"{msg['volume']:.2f} L\n"
-                    )
-                    clear_fo_state(args.id_operario)
-                    break
-                elif k == "DENIED":
-                    print(f"\n[DENEGADO RIEGO PREVIO] {msg['reason']}\n")
-                    clear_fo_state(args.id_operario)
-                    break
+                try:
+                    duration = int(dur_str)
+                    execute_irrigation(producer, consumer, args.id_operario, ws_id, duration, stations)
+                except ValueError as err:
+                    # Lanza la excepción requerida
+                    raise err
 
-        elif last_completed and (
-            (saved_state and saved_state.get("id") == last_completed.get("id"))
-            or (time.time() - last_completed.get("timestamp", 0) < 300)
-        ):
-            recovered_ws = last_completed.get("ws")
-            print(
-                f"\n[RECUPERACION] Resultado del servicio solicitado antes de caerse:\n"
-                f"FIN: {last_completed['reason']} | "
-                f"{last_completed['elapsed']:.1f}s | "
-                f"{last_completed['volume']:.2f} L\n",
-                flush=True,
-            )
-            clear_fo_state(args.id_operario)
+            elif opcion == "3":
+                stations, _, _ = get_stations(producer, consumer, args.id_operario)
+                archivo = input("Ruta del archivo [peticiones.txt]: ").strip() or "peticiones.txt"
 
-        elif saved_state:
-            clear_fo_state(args.id_operario)
+                if not os.path.exists(archivo):
+                    print(f"[ERROR] No se encuentra el archivo '{archivo}'")
+                    continue
 
-        # Si solo se arrancó para listar o el riego pedido ya se recuperó
-        remaining_tasks = tasks
-        if recovered_ws and len(tasks) == 1 and tasks[0][0] == recovered_ws:
-            remaining_tasks = []
+                tasks = []
+                with open(archivo, encoding="utf-8-sig") as stream:
+                    for num, line in enumerate(stream, 1):
+                        if not line.strip():
+                            continue
+                        try:
+                            ws, duration = line.strip().split(",")
+                            tasks.append((ws.strip(), int(duration.strip())))
+                        except ValueError:
+                            print(f"[ERROR] Línea {num} no válida en '{archivo}' (formato esperado: WS-01,10)")
 
-        for index, (ws, duration) in enumerate(remaining_tasks):
-            request_id = uuid.uuid4().hex
+                for i, (ws, duration) in enumerate(tasks):
+                    execute_irrigation(producer, consumer, args.id_operario, ws, duration, stations)
+                    if i + 1 < len(tasks):
+                        print("Esperando 4 segundos para la siguiente petición...")
+                        time.sleep(4)
 
-            save_fo_state(args.id_operario, {
-                "id": request_id,
-                "ws": ws,
-                "duration": duration,
-                "operator": args.id_operario,
-                "time": time.time(),
-            })
+            elif opcion == "4":
+                print("Cerrando sesión del operario. ¡Hasta luego!")
+                break
 
-            publish(producer, "fo_requests", {
-                "type": "REQUEST",
-                "id": request_id,
-                "operator": args.id_operario,
-                "ws": ws,
-                "duration": duration,
-            })
-
-            print(f"[SOLICITUD] {ws}, {duration}s")
-
-            for message in wait_response(
-                consumer, request_id, 20
-            ):
-                kind = message["type"]
-
-                if kind == "PENDING":
-                    print(
-                        "CENTRAL comprueba el arranque con el Engine..."
-                    )
-
-                elif kind == "ACK":
-                    print(
-                        "Riego iniciado y confirmado por el Engine"
-                    )
-
-                elif kind == "UPDATE":
-                    print(
-                        f"{message['elapsed']:.1f}s | "
-                        f"{message['flow']:.1f} L/min | "
-                        f"{message['volume']:.2f} L"
-                    )
-
-                elif kind == "DENIED":
-                    clear_fo_state(args.id_operario)
-                    reason = message.get("reason", "DESCONOCIDO")
-                    if reason == "ESTACION_NO_EXISTE":
-                        raise ValueError(
-                            f"Excepción: La estación '{ws}' no existe en el sistema."
-                        )
-                    elif reason == "OPERARIO_NO_REGISTRADO":
-                        raise ValueError(
-                            f"Excepción: El operario '{args.id_operario}' no existe en el sistema."
-                        )
-                    else:
-                        print(f"DENEGADO: {reason}")
-                    break
-
-                elif kind == "END":
-                    clear_fo_state(args.id_operario)
-                    print(
-                        f"FIN: {message['reason']} | "
-                        f"{message['elapsed']:.1f}s | "
-                        f"{message['volume']:.2f} L"
-                    )
-                    break
-
-            if index + 1 < len(remaining_tasks):
-                print(
-                    "Esperando 4 segundos para "
-                    "la siguiente peticion..."
-                )
-                time.sleep(4)
+            else:
+                print("[AVISO] Opción inválida. Introduce un número del 1 al 4.")
 
     except (TimeoutError, KeyboardInterrupt) as error:
-        print(f"[FO] {error}")
+        print(f"\n[FO] {error}")
 
     finally:
         consumer.close()
