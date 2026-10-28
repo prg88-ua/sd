@@ -1,5 +1,7 @@
 """Engine: mide y comunica el riego real, incluido el interrumpido."""
 import argparse
+import json
+import os
 import queue
 import socket
 import threading
@@ -11,6 +13,51 @@ from wm_common import (
 )
 
 FLOW = 15.0  # Litros/minuto de la simulacion.
+
+
+def get_engine_state_file(station):
+    return f"engine_state_{station}.json"
+
+
+def save_engine_state(station, run, elapsed, volume, status="IN_PROGRESS"):
+    state_file = get_engine_state_file(station)
+    tmp_file = f"{state_file}.tmp"
+    data = {
+        "id": run["id"],
+        "ws": station,
+        "operator": run.get("operator"),
+        "duration": run.get("duration"),
+        "elapsed": round(elapsed, 3),
+        "volume": round(volume, 4),
+        "status": status,
+        "timestamp": time.time(),
+    }
+    try:
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_file, state_file)
+    except Exception as e:
+        print(f"[PERSISTENCIA] Error guardando estado: {e}", flush=True)
+
+
+def clear_engine_state(station):
+    state_file = get_engine_state_file(station)
+    try:
+        if os.path.exists(state_file):
+            os.remove(state_file)
+    except OSError:
+        pass
+
+
+def load_engine_state(station):
+    state_file = get_engine_state_file(station)
+    if os.path.exists(state_file):
+        try:
+            with open(state_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
 
 class Valve:
@@ -88,6 +135,7 @@ class Valve:
         try:
             self.event("STARTED", run)
             started = time.monotonic()
+            save_engine_state(self.station, run, 0.0, 0.0, "IN_PROGRESS")
 
             print("[VALVULA] ABIERTA", flush=True)
 
@@ -106,6 +154,7 @@ class Valve:
                     run["duration"], time.monotonic() - started
                 )
                 volume = FLOW * elapsed / 60
+                save_engine_state(self.station, run, elapsed, volume, "IN_PROGRESS")
 
                 if (
                     stopped
@@ -163,6 +212,7 @@ class Valve:
                     elapsed=round(elapsed, 3),
                     reason=reason,
                 )
+                clear_engine_state(self.station)
             except Exception as error:
                 print(
                     f"[FIN] No pudo notificarse: {error}",
@@ -394,6 +444,32 @@ def main():
     ).start()
 
     print(f"[ENGINE] Identidad: {station}", flush=True)
+
+    # Requisito de Resiliencia: si el Engine cayo durante un riego,
+    # al recuperarse envia el estado final con los litros reales regados a medias.
+    saved = load_engine_state(station)
+    if saved and saved.get("status") == "IN_PROGRESS":
+        print(
+            f"[RECUPERACION] Detectado riego previo interrumpido por caída súbita: "
+            f"ID={saved['id']}, Volumen={saved['volume']:.2f} L, Tiempo={saved['elapsed']:.1f} s",
+            flush=True,
+        )
+        recovery_event = {
+            "type": "END",
+            "id": saved["id"],
+            "ws": station,
+            "flow": 0.0,
+            "volume": float(saved["volume"]),
+            "elapsed": float(saved["elapsed"]),
+            "reason": "INTERRUMPIDO_POR_CAIDA_ENGINE",
+            "operator": saved.get("operator"),
+        }
+        try:
+            publish(producer, "ws_events", recovery_event)
+            print("[RECUPERACION] Estado final del riego enviado a CENTRAL vía Kafka", flush=True)
+        except Exception as err:
+            print(f"[RECUPERACION] Error enviando estado final a Kafka: {err}", flush=True)
+        clear_engine_state(station)
 
     try:
         while not stopped.is_set():

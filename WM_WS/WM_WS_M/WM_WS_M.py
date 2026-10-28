@@ -30,10 +30,6 @@ class Monitor:
                 send_line(sock, "STATUS#ERROR#INVALID_MESSAGE")
                 return
 
-            if not self.registered.is_set():
-                send_line(sock, "STATUS#ERROR#NOT_REGISTERED")
-                return
-
             with self.lock:
                 if self.engine is not None:
                     send_line(sock, "STATUS#ERROR#DUPLICATE_ENGINE")
@@ -51,13 +47,6 @@ class Monitor:
                 with self.lock:
                     if self.engine is not sock:
                         break
-
-                if not self.registered.is_set():
-                    with self.lock:
-                        self.last_ok = 0
-
-                    time.sleep(0.2)
-                    continue
 
                 started = time.monotonic()
                 seq += 1
@@ -142,9 +131,10 @@ class Monitor:
                         f"REGISTRO#{self.args.ws_id}#{self.args.location}",
                     )
 
-                    if reader.read() != "STATUS#OK#REGISTERED":
+                    reg_response = reader.read()
+                    if reg_response != "STATUS#OK#REGISTERED":
                         raise ValueError(
-                            "Registro rechazado por CENTRAL"
+                            f"Registro rechazado por CENTRAL: {reg_response}"
                         )
 
                     self.registered.set()
@@ -178,21 +168,9 @@ class Monitor:
 
             finally:
                 self.registered.clear()
-
-                # Al perder CENTRAL, forzamos al Engine a cerrar el riego.
-                # Despues podra reconectarse y volver a identificarse.
-                with self.lock:
-                    engine = self.engine
-                    self.engine = None
-                    self.last_ok = 0
-
-                if engine is not None:
-                    try:
-                        engine.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-
-                    engine.close()
+                # NO cortar la conexion con el Engine al perder Central.
+                # El requisito exige que la estacion siga prestando servicio
+                # y termine de regar sus litros programados aunque Central caiga.
 
             time.sleep(2)
 

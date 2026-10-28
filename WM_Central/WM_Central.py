@@ -25,6 +25,7 @@ class Central:
         self.monitors = {}
         self.active = {}
         self.seen = set()
+        self.last_completed_by_operator = {}
 
         with connection() as conn:
             self.stations = {
@@ -130,6 +131,16 @@ class Central:
 
         self.save(ws)
 
+        if run.get("operator"):
+            self.last_completed_by_operator[run["operator"]] = {
+                "id": run["id"],
+                "ws": ws_id,
+                "volume": run["volume"],
+                "elapsed": run["elapsed"],
+                "reason": reason,
+                "timestamp": time.time(),
+            }
+
         self.reply(
             run,
             "END",
@@ -174,9 +185,54 @@ class Central:
                 return
 
             if message.get("type") == "LIST":
+                op = message.get("operator")
+                active_order = None
+                for a_ws_id, r in self.active.items():
+                    if r.get("operator") == op:
+                        active_order = {
+                            "id": r["id"],
+                            "ws": a_ws_id,
+                            "duration": r.get("duration"),
+                            "volume": r.get("volume", 0),
+                            "elapsed": r.get("elapsed", 0),
+                            "started": r.get("started", False),
+                        }
+                        break
+
+                last_comp = self.last_completed_by_operator.get(op)
                 self.reply(
-                    message, "STATIONS", stations=self.snapshot()
+                    message,
+                    "STATIONS",
+                    stations=self.snapshot(),
+                    active_order=active_order,
+                    last_completed=last_comp,
                 )
+                return
+
+            if message.get("type") == "RECOVER":
+                op = message.get("operator")
+                for a_ws_id, r in self.active.items():
+                    if r.get("operator") == op:
+                        self.reply(
+                            message,
+                            "UPDATE",
+                            ws=a_ws_id,
+                            volume=r.get("volume", 0),
+                            elapsed=r.get("elapsed", 0),
+                            flow=r.get("flow", 0),
+                        )
+                        return
+                last_comp = self.last_completed_by_operator.get(op)
+                if last_comp:
+                    self.emit("fo_responses", {
+                        "type": "END",
+                        "id": last_comp["id"],
+                        "operator": op,
+                        "ws": last_comp["ws"],
+                        "volume": last_comp["volume"],
+                        "elapsed": last_comp["elapsed"],
+                        "reason": last_comp["reason"],
+                    })
                 return
 
             if (
@@ -247,6 +303,55 @@ class Central:
             run = self.active.get(ws_id)
 
             if not run or message.get("id") != run["id"]:
+                if message.get("type") == "END" and ws_id in self.stations:
+                    volume = float(message.get("volume", 0))
+                    elapsed = float(message.get("elapsed", 0))
+                    reason = message.get("reason", "INTERRUMPIDO_POR_CAIDA_ENGINE")
+                    req_id = message.get("id")
+                    op = message.get("operator")
+
+                    ws = self.stations[ws_id]
+                    ws["accumulated_volume"] = volume
+                    ws["current_flow"] = 0
+                    ws["current_operator"] = None
+                    self.save(ws)
+
+                    with connection() as conn:
+                        conn.execute("""
+                            INSERT INTO irrigation_history
+                            (ws_id,operator_id,start_time,end_time,total_volume)
+                            VALUES (?,?,?,?,?)
+                        """, (
+                            ws_id,
+                            op or "DESCONOCIDO",
+                            datetime.now().isoformat(),
+                            datetime.now().isoformat(),
+                            volume,
+                        ))
+
+                    if op:
+                        self.last_completed_by_operator[op] = {
+                            "id": req_id,
+                            "ws": ws_id,
+                            "volume": volume,
+                            "elapsed": elapsed,
+                            "reason": reason,
+                            "timestamp": time.time(),
+                        }
+
+                    self.emit("fo_responses", {
+                        "type": "END",
+                        "id": req_id,
+                        "operator": op,
+                        "ws": ws_id,
+                        "volume": volume,
+                        "elapsed": elapsed,
+                        "reason": reason,
+                    })
+                    print(
+                        f"[RECUPERADO] {ws_id}: {reason}, {volume:.2f} L",
+                        flush=True,
+                    )
                 return  # No aplicar un evento de un riego anterior.
 
             ws = self.stations[ws_id]
@@ -375,6 +480,16 @@ class Central:
                                 sock,
                                 "STATUS#ERROR#DUPLICATE_STATION",
                             )
+                            continue
+
+                        with connection() as conn:
+                            row = conn.execute(
+                                "SELECT * FROM watering_stations WHERE id=?",
+                                (candidate,),
+                            ).fetchone()
+
+                        if not row:
+                            send_line(sock, "STATUS#ERROR#STATION_NOT_REGISTERED")
                             continue
 
                         ws_id = candidate
