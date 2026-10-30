@@ -16,6 +16,7 @@ $script:ConfigKey = 'HKCU:\Software\WaterManagement\Bat'
 $script:Config = @{ Role = 'fo'; AwsHost = ''; WebPort = 5000; CentralPort = 6000; KafkaPort = 9092; SourceDir = '' }
 $script:ProjectDir = ''
 $script:SourceHash = ''
+$script:StationSettings = @{}
 $script:RequiredSources = @('Dockerfile', '.dockerignore', 'requirements.txt', 'wm_common.py', 'wm_state.py',
     'WM_Central/database.py', 'WM_Central/WM_Central.py', 'WM_Dashboard/index.html',
     'WM_FO/WM_FO.py', 'WM_WS/WM_WS_M/WM_WS_M.py', 'WM_WS/WM_WS_E/WM_WS_E.py')
@@ -69,6 +70,14 @@ function Read-Config {
         foreach ($key in @($script:Config.Keys)) {
             if ($null -ne $saved.PSObject.Properties[$key]) { $script:Config[$key] = $saved.$key }
         }
+        if ($saved.PSObject.Properties['StationsJson'] -and $saved.StationsJson) {
+            $stations = $saved.StationsJson | ConvertFrom-Json
+            foreach ($entry in $stations.PSObject.Properties) {
+                $script:StationSettings[$entry.Name] = @{
+                    Location=[string]$entry.Value.Location; MonitorPort=[int]$entry.Value.MonitorPort
+                }
+            }
+        }
     }
 }
 
@@ -78,6 +87,9 @@ function Save-Config {
     foreach ($key in $script:Config.Keys) {
         New-ItemProperty -LiteralPath $script:ConfigKey -Name $key -Value ([string]$script:Config[$key]) -PropertyType String -Force | Out-Null
     }
+    # Las preferencias de cada WS sobreviven a CLEAN sin crear archivos auxiliares.
+    $stationsJson = ConvertTo-Json -InputObject $script:StationSettings -Depth 5 -Compress
+    New-ItemProperty -LiteralPath $script:ConfigKey -Name 'StationsJson' -Value $stationsJson -PropertyType String -Force | Out-Null
 }
 
 function Test-ProjectFolder {
@@ -217,13 +229,92 @@ function Read-Batch {
     return $resolved
 }
 
+function Assert-StationSettings {
+    param([hashtable]$Station)
+    if (!$Station -or [string]::IsNullOrWhiteSpace($Station.Location) -or
+        $Station.Location.Length -gt 100 -or $Station.Location.IndexOfAny([char[]]"#`r`n`0") -ge 0) {
+        throw 'La ubicacion debe tener entre 1 y 100 caracteres, sin # ni saltos de linea.'
+    }
+    if ($Station.MonitorPort -lt 1 -or $Station.MonitorPort -gt 65535) {
+        throw 'El puerto del Monitor debe estar entre 1 y 65535.'
+    }
+}
+
+function Get-StationSettings {
+    param([string]$Identity)
+    if ($script:StationSettings.ContainsKey($Identity)) {
+        $saved = $script:StationSettings[$Identity]
+        return @{Location=[string]$saved.Location; MonitorPort=[int]$saved.MonitorPort}
+    }
+    $station = @{Location="Estacion_$Identity"; MonitorPort=7000}
+    $monitor = Get-Container "wm-lab-monitor-$Identity"
+    if ($null -ne $monitor -and $monitor.Config.Labels.'wm.launcher' -eq $script:Owner) {
+        # Importar tambien contenedores del BAT anterior, que no tenian estas etiquetas.
+        $command = @($monitor.Config.Cmd)
+        $index = [Array]::IndexOf($command, '--location')
+        if ($index -ge 0 -and $index + 1 -lt $command.Count) { $station.Location = $command[$index+1] }
+        $index = [Array]::IndexOf($command, '--monitor-port')
+        if ($index -ge 0 -and $index + 1 -lt $command.Count) { $station.MonitorPort = [int]$command[$index+1] }
+        if ($monitor.Config.Labels.'wm.location') { $station.Location = $monitor.Config.Labels.'wm.location' }
+        if ($monitor.Config.Labels.'wm.monitor-port') { $station.MonitorPort = [int]$monitor.Config.Labels.'wm.monitor-port' }
+    }
+    return $station
+}
+
+function Read-StationSettings {
+    param([string]$Identity, [switch]$Custom)
+    $station = Get-StationSettings $Identity
+    # Recuperar un componente caido nunca cambia la configuracion del que sigue vivo.
+    $running = @('monitor','engine') | ForEach-Object { Get-Container "wm-lab-$_-$Identity" } |
+        Where-Object { $_ -and $_.State.Running }
+    if (@($running).Count) { return $station }
+    $location = (Read-Host "Ubicacion de $Identity [$($station.Location)]").Trim()
+    if ($location) { $station.Location = $location }
+    if ($Custom) {
+        $station.MonitorPort = Read-Number "Puerto interno del Monitor [$($station.MonitorPort)]" $station.MonitorPort 65535 1
+    }
+    Assert-StationSettings $station
+    return $station
+}
+
+function Get-NewIdentities {
+    param([int]$Count)
+    $prefix = if ($script:Config.Role -eq 'fo') { 'FO' } else { 'WS' }
+    $known = @(Get-LocalIdentities)
+    if ($prefix -eq 'WS') { $known += @($script:StationSettings.Keys) }
+    $selected = @()
+    for ($number=1; $selected.Count -lt $Count -and $number -le 999999; $number++) {
+        $identity = '{0}-{1:D2}' -f $prefix, $number
+        if ($known -notcontains $identity) { $selected += $identity }
+    }
+    if ($selected.Count -ne $Count) { throw 'No quedan IDs automaticos disponibles.' }
+    return $selected
+}
+
+function Get-PartSignature {
+    param([string]$Identity, [string]$Batch, [hashtable]$Station)
+    $signature = '{0}|{1}|{2}|{3}|{4}' -f $script:Config.AwsHost, $script:Config.WebPort, $script:Config.CentralPort, $script:Config.KafkaPort, $Batch
+    if ($Identity.StartsWith('WS-')) {
+        # Una huella evita meter comillas de JSON en un argumento nativo de
+        # Windows PowerShell. Sirve para detectar cambios, no para autenticarse.
+        $json = ConvertTo-Json -InputObject ([ordered]@{Location=$Station.Location; MonitorPort=$Station.MonitorPort}) -Compress
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $signature += '|' + [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($json))).Replace('-','')
+        } finally { $sha.Dispose() }
+    }
+    return $signature
+}
+
 function Get-ConsoleCode {
     param([string]$Name, [string]$Part)
     # Nombre y tipo proceden de etiquetas propias y se validan antes de usarlos.
     if ($Name -notmatch '^wm-lab-(fo|monitor|engine)-(FO|WS)-[0-9]{2,6}$') { throw 'Nombre de contenedor invalido.' }
     if ($Part -notin @('fo', 'monitor', 'engine')) { throw 'Componente invalido.' }
     $command = if ($Part -eq 'monitor') {
-        "& docker logs --tail 30 -f '$Name'"
+        # La terminal controla el proceso: Ctrl+C debe detener el Monitor,
+        # no solamente cerrar un visor de logs que deje la WS conectada.
+        "& docker logs --tail 30 '$Name'; & docker attach --sig-proxy=true '$Name'"
     } else {
         "& docker logs --tail 20 '$Name'; & docker attach --sig-proxy=false '$Name'"
     }
@@ -242,9 +333,9 @@ function Open-Console {
 }
 
 function Start-Part {
-    param([string]$Identity, [string]$Part, [string]$Batch = '')
+    param([string]$Identity, [string]$Part, [string]$Batch = '', [hashtable]$Station = $null)
     $name = "wm-lab-$Part-$Identity"
-    $signature = '{0}|{1}|{2}|{3}|{4}' -f $script:Config.AwsHost, $script:Config.WebPort, $script:Config.CentralPort, $script:Config.KafkaPort, $Batch
+    $signature = Get-PartSignature $Identity $Batch $Station
     $existing = Get-Container $name
     if ($null -ne $existing) {
         if ($existing.Config.Labels.'wm.launcher' -ne $script:Owner) { throw "$name pertenece a otro despliegue." }
@@ -256,6 +347,9 @@ function Start-Part {
         $argsList = @('create', '--init', '-it', '--name', $name, '--network', $script:Network,
             '--label', "wm.launcher=$script:Owner", '--label', "wm.id=$Identity", '--label', "wm.part=$Part",
             '--label', "wm.source=$script:SourceHash", '--label', "wm.config=$signature")
+        if ($Identity.StartsWith('WS-')) {
+            $argsList += @('--label', "wm.location=$($Station.Location)", '--label', "wm.monitor-port=$($Station.MonitorPort)")
+        }
         if ($Part -in @('fo', 'engine')) {
             $argsList += @('--mount', "source=$name-data,target=/data")
         }
@@ -266,10 +360,10 @@ function Start-Part {
         $command = switch ($Part) {
             'fo' { @('WM_FO/WM_FO.py', '--kafka-broker', $broker, '--id-operario', $Identity) }
             'monitor' { @('WM_WS/WM_WS_M/WM_WS_M.py', '--central-host', $script:Config.AwsHost,
-                '--central-port', [string]$script:Config.CentralPort, '--monitor-port', '7000',
-                '--ws-id', $Identity, '--location', "Estacion_$Identity") }
+                '--central-port', [string]$script:Config.CentralPort, '--monitor-port', [string]$Station.MonitorPort,
+                '--ws-id', $Identity, '--location', $Station.Location) }
             'engine' { @('WM_WS/WM_WS_E/WM_WS_E.py', '--monitor-host', "wm-lab-monitor-$Identity",
-                '--monitor-port', '7000', '--kafka-broker', $broker) }
+                '--monitor-port', [string]$Station.MonitorPort, '--kafka-broker', $broker) }
         }
         if ($Part -eq 'fo' -and $Batch) { $command += @('--file', '/app/lote.txt') }
         Invoke-Docker -Arguments ($argsList + @($script:Image, 'python') + $command) | Out-Null
@@ -280,15 +374,37 @@ function Start-Part {
 }
 
 function Start-Identity {
-    param([string]$Identity, [string]$Batch = '')
+    param([string]$Identity, [string]$Batch = '', [hashtable]$Station = $null)
+    if ($Identity.StartsWith('WS-')) {
+        if ($null -eq $Station) { $Station = Get-StationSettings $Identity }
+        Assert-StationSettings $Station
+    }
+    # Comprobar ambas mitades ANTES de recrear alguna: evita cambiar un Monitor
+    # mientras su Engine sigue activo con un puerto o ubicacion diferentes.
+    $signature = Get-PartSignature $Identity $Batch $Station
+    $parts = if ($Identity.StartsWith('WS-')) { @('monitor','engine') } else { @('fo') }
+    foreach ($part in $parts) {
+        $item = Get-Container "wm-lab-$part-$Identity"
+        if ($null -ne $item) {
+            if ($item.Config.Labels.'wm.launcher' -ne $script:Owner) { throw "$Identity pertenece a otro despliegue." }
+            if ($item.State.Running -and ($item.Config.Labels.'wm.source' -ne $script:SourceHash -or $item.Config.Labels.'wm.config' -ne $signature)) {
+                throw "Cierra $Identity con la opcion 6 antes de cambiar su version, ubicacion o puertos."
+            }
+        }
+    }
     Write-Host "Abriendo/recuperando $Identity..."
     $body = if ($script:Config.Role -eq 'fo') {
         @{operators=@(@{id=$Identity; name="Operario_$Identity"})}
-    } else { @{stations=@(@{id=$Identity; location="Estacion_$Identity"})} }
+    } else { @{stations=@(@{id=$Identity; location=$Station.Location})} }
     try { Invoke-Central '/api/catalog' $body | Out-Null }
     catch { throw "No se pudo registrar $Identity. Actualiza Central en AWS con esta version. $($_.Exception.Message)" }
     if ($script:Config.Role -eq 'fo') { Start-Part $Identity 'fo' $Batch }
-    else { Start-Part $Identity 'monitor'; Start-Part $Identity 'engine' }
+    else {
+        Start-Part $Identity 'monitor' '' $Station
+        Start-Part $Identity 'engine' '' $Station
+        $script:StationSettings[$Identity] = $Station
+        Save-Config
+    }
 }
 
 function Stop-Identity {
@@ -390,35 +506,31 @@ function Start-Launcher {
         while ($true) {
             Write-Host "`n=== WATER MANAGEMENT | $($script:Config.Role) | AWS $($script:Config.AwsHost) ==="
             Write-Host "Codigo: $script:ProjectDir"
-            Write-Host '1. Abrir mas    2. Ajustar total    3. Abrir/recuperar ID'
+            Write-Host '1. Abrir varias    2. Anadir una    3. Crear/recuperar ID (WS: ubicacion y puerto)'
             Write-Host '4. Terminales   5. Estado          6. Cerrar ID'
             Write-Host '7. Simular caida  8. CLEAN local   9. Preparar imagen'
-            Write-Host 'C. Configurar   S. Carpeta codigo   P. Panel web   0. Salir'
+            Write-Host 'C. Configurar   P. Panel web   0. Salir'
             try {
                 $option = (Read-Host 'Opcion').Trim().ToUpperInvariant()
                 switch ($option) {
                     {$_ -in @('1', '2', '3')} {
-                        $count = 0; $selected = @()
+                        $selected = @()
                         if ($option -eq '3') { $selected = @(Normalize-Identity (Read-Host 'ID')) }
-                        else { $count = Read-Number 'Cantidad' }
-                        $batch = if ($option -eq '3' -or $count -gt 0) { Read-Batch } else { '' }
+                        else {
+                            $count = if ($option -eq '2') { 1 } else { Read-Number 'Cantidad a anadir' 1 500 1 }
+                            $selected = @(Get-NewIdentities $count)
+                        }
+                        $batch = Read-Batch
+                        $settings = @{}
+                        if ($script:Config.Role -eq 'ws') {
+                            foreach ($identity in $selected) {
+                                $settings[$identity] = Read-StationSettings $identity -Custom:($option -eq '3')
+                            }
+                        }
                         Assert-Central
-                        if ($option -ne '2' -or $count -gt 0) { Ensure-Image; Ensure-Network }
-                        $prefix = if ($script:Config.Role -eq 'fo') { 'FO' } else { 'WS' }
-                        if ($option -eq '2' -and $count -gt 0) {
-                            $selected = @(1..$count | ForEach-Object { '{0}-{1:D2}' -f $prefix, $_ })
-                        }
-                        if ($option -eq '1') {
-                            for ($number = 1; $selected.Count -lt $count -and $number -le 999999; $number++) {
-                                $identity = '{0}-{1:D2}' -f $prefix, $number
-                                if (!(Test-ActiveIdentity $identity)) { $selected += $identity }
-                            }
-                        }
-                        foreach ($identity in $selected) { Start-Identity $identity $batch }
-                        if ($option -eq '2') {
-                            foreach ($identity in @(Get-LocalIdentities)) {
-                                if ($selected -notcontains $identity) { Stop-Identity $identity }
-                            }
+                        Ensure-Image; Ensure-Network
+                        foreach ($identity in $selected) {
+                            Start-Identity $identity $batch $settings[$identity]
                         }
                         Wait-Stations $selected
                     }
@@ -446,7 +558,6 @@ function Start-Launcher {
                     '8' { Clear-Local }
                     '9' { Ensure-Image }
                     'C' { Set-Config }
-                    'S' { Set-ProjectFolder (Read-Host 'Ruta de la carpeta sd con el codigo'); Save-Config }
                     'P' { Start-Process ('http://{0}:{1}' -f $script:Config.AwsHost, $script:Config.WebPort) | Out-Null }
                     '0' {
                         if ((Read-Host 'Cerrar componentes con CLEAN antes de salir? [s/N]').Trim().ToLowerInvariant() -eq 's') { Clear-Local }

@@ -17,17 +17,45 @@ preparación necesita Internet para descargar la imagen base y las dependencias.
 
 Lo más sencillo es dejar el BAT dentro de `sd`, junto a `Dockerfile` y
 `requirements.txt`. También detecta una subcarpeta `sd` junto al BAT. Si el
-código está en otro sitio, el lanzador pide la ruta de esa carpeta. La opción
-`S` permite cambiarla después; la ubicación elegida aparece sobre el menú.
+código está en otro sitio, el lanzador pide la ruta de esa carpeta. La ubicación
+elegida aparece sobre el menú. Se ha retirado la opción «Carpeta código»;
+se conserva la detección inicial y el argumento `--project`.
 No genera scripts, copias del código ni archivos auxiliares para arrancar.
 
 Elige `fo` en el PC de operarios y `ws` en el de estaciones, e introduce la IP
 pública de AWS. Los puertos por defecto son 5000 (panel), 6000 (Central) y
-9092 (Kafka). El menú permite añadir componentes, ajustar el total, abrir o
+9092 (Kafka). El menú permite añadir componentes, crear o
 recuperar un ID, abrir sus terminales, consultar el estado, detenerlos,
 simular una caída, preparar la imagen y hacer CLEAN. También permite cambiar
-la configuración y abrir el panel web. Por ejemplo, ajustar el total a 2 en
-`ws` abre WS-01 y WS-02 con sus cuatro terminales; en `fo` abre dos operarios.
+la configuración y abrir el panel web. Por ejemplo, en el perfil
+`ws` se usa **1. Abrir varias → 2** para crear dos estaciones con sus
+cuatro terminales; en `fo` crea dos operarios. Las opciones son:
+
+- **1. Abrir varias:** añade la cantidad indicada; no detiene las existentes.
+- **2. Añadir una:** añade una instancia con ID automático, sin pedir cantidad.
+- **3. Crear/recuperar ID:** permite indicar un ID `WS-NN` o `FO-NN`.
+  Al crear una WS o configurar una completamente detenida, pide ubicación y
+  puerto interno del Monitor. Si queda una parte activa, recupera la otra
+  usando su configuración anterior sin cambiarla.
+
+En las opciones 1 y 2 se pide la ubicación de cada WS nueva; Enter conserva
+el valor propuesto y se usa el puerto 7000. La opción 3 permite elegir otro
+puerto entre 1 y 65535 o recuperar la configuración guardada. Monitor y
+Engine reciben siempre el mismo puerto. Son puertos internos de contenedores
+distintos, de modo que varias WS pueden usar 7000 sin colisiones en Windows.
+Los IDs automáticos evitan las instancias locales conocidas y las WS con
+preferencias guardadas; para recuperar un ID anterior se usa la opción 3.
+
+La ubicación y el puerto de cada WS se conservan en las preferencias del usuario
+de Windows, incluso después de CLEAN. Los contenedores anteriores también se
+pueden importar leyendo sus argumentos. No se cambian parámetros con una mitad
+de la estación activa: primero se cierra la WS con la opción 6.
+
+La terminal del Monitor muestra los últimos logs y utiliza `docker attach`
+con propagación de señales. **Ctrl+C detiene el Monitor**: Central detecta
+su desconexión y muestra la WS en gris; el Engine vivo interrumpe el riego.
+Cerrar con la X no tiene una garantía adicional de parada. La opción 7 sigue
+permitiendo forzar una caída y la 3 recuperar el mismo ID.
 
 El BAT ejecuta la construcción usando la carpeta real del proyecto y su
 `.dockerignore`. Detecta cambios en los archivos de la aplicación para
