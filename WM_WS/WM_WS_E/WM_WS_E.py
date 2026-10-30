@@ -68,8 +68,7 @@ class Valve:
                 return
 
             # No comparar expires con la hora local: AWS y el aula pueden tener
-            # relojes distintos. El diario anterior impide repetir el mismo ID.
-
+            # relojes distintos. El diario impide repetir un riego ya conocido.
             duration = run.get("duration")
 
             if (
@@ -355,23 +354,7 @@ def keyboard(
             print(f"[MENU] {error}", flush=True)
 
 
-<<<<<<< HEAD
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--monitor-host", default="localhost")
-    parser.add_argument("--monitor-port", type=int, required=True)
-    parser.add_argument("--kafka-broker", required=True)
-    args = parser.parse_args()
-
-    # docker stop envía SIGTERM. Convertirlo en la salida habitual permite
-    # cerrar la válvula y guardar END antes de que el contenedor termine.
-    def terminate(signum, frame):
-        raise KeyboardInterrupt
-    signal.signal(signal.SIGTERM, terminate)
-
-=======
 def run(args):
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     # Preparar Kafka antes de responder OK a las comprobaciones de salud.
     producer, consumer = open_bus(
         args.kafka_broker, ("ws_orders",)
@@ -412,7 +395,6 @@ def run(args):
 
     outbox = queue.Queue()
     valve = Valve(station, outbox, fault, link)
-    sender_stopped = threading.Event()
 
     for event in valve.journal.recover():
         print(f"[RECUPERACIÓN] Resultado pendiente: {event['id']}", flush=True)
@@ -420,10 +402,7 @@ def run(args):
 
     sender_thread = threading.Thread(
         target=sender,
-<<<<<<< HEAD
-=======
         # El emisor sigue vivo hasta que la válvula haya guardado y encolado END.
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
         args=(producer, outbox, sender_stopped, valve),
         daemon=True,
     )
@@ -474,16 +453,6 @@ def run(args):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer)
 
-<<<<<<< HEAD
-        if valve.worker:
-            valve.worker.join(timeout=3)
-        # Mantener al emisor vivo hasta que el trabajador haya guardado END.
-        sender_stopped.set()
-        # Si la red sigue caída, el END queda en disco para el próximo arranque.
-        sender_thread.join(timeout=2)
-        consumer.close()
-        producer.close(timeout=2)
-=======
 
 def shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer):
     """Cerrar, guardar y después intentar confirmar el resultado en Kafka."""
@@ -520,7 +489,6 @@ def main():
         print("[ENGINE] Arranque interrumpido; se conserva el diario.", flush=True)
     finally:
         signal.signal(signal.SIGTERM, previous)
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
 
 if __name__ == "__main__":

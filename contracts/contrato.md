@@ -92,29 +92,20 @@ El Engine envía mediciones aproximadamente cada segundo y comunica la finalizac
 
 Si se pierde la comunicación y no puede obtenerse la medida final, CENTRAL comunica una interrupción identificada como tal y utiliza la última medición recibida.
 
-<<<<<<< HEAD
 Cada instancia consume los mensajes y filtra por estación o petición. El Engine
 inicia su lectura al final de Kafka y utiliza su diario para recuperar resultados;
 los IDs persistentes impiden ejecutar dos veces un riego ya conocido. Central
 recupera los mensajes pendientes desde sus posiciones guardadas.
-=======
-Cada instancia consume los mensajes y filtra por estación o petición. Al arrancar no ejecuta órdenes antiguas.
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
 
 ## Recuperación persistente (revisión de resiliencia)
 
-<<<<<<< HEAD
 - REQUEST puede incluir submitted_at (segundos Unix) como información.
   Central no deniega pedidos por su antigüedad ni por faltar esa fecha.
   Engine ignora expires si llega de una versión anterior. Así no hace falta
   sincronizar la hora de AWS y los PCs. LIST admite recover_id.
 - Las duraciones, latidos y esperas siguen usando intervalos monotónicos
   locales. Las peticiones pendientes nunca procesadas no caducan por fecha.
-=======
-- REQUEST añade submitted_at (segundos Unix). Central deniega pedidos no
-  registrados sin fecha o de más de 60 segundos. LIST admite recover_id.
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 - STATIONS añade active_order y last_completed, recuperados desde SQLite.
 - END incluye final y updated_at en respuestas del FO. final=false identifica
   una última medida provisional; una medida posterior del Engine puede corregirla.
@@ -127,32 +118,18 @@ Cada instancia consume los mensajes y filtra por estación o petición. Al arran
 - Un resultado de otro ID no cambia los datos del riego actual de la estación.
 - La WS mantiene sus latidos locales y completa el riego aunque caiga Central.
 
-<<<<<<< HEAD
 ## Altas desde el BAT
 
 POST /api/catalog recibe operators (lista de objetos con id y name) y stations
 (lista de objetos con id y location). Valida el lote completo antes de insertar.
 Los IDs nuevos se incorporan a SQLite y a la memoria de Central sin reiniciar.
 Repetir un alta conserva las descripciones, estados e historial existentes.
-=======
-## Altas administrativas del lanzador
 
-`POST /api/admin/catalog` recibe JSON con arrays opcionales `operators`
-(`id`, `name`) y `stations` (`id`, `location`). Cada array admite hasta 1000
-elementos. El ID admite 1-80 letras ASCII, números, guion o guion bajo. Los
-textos admiten 1-200 caracteres y no pueden contener separadores de sockets.
-
-No requiere contraseña ni cabecera de autenticación. Devuelve 400 para un lote
-inválido, 413 si el cuerpo supera 1 MiB y 200 con `created`, `operators` y
-`stations` cuando el alta es correcta.
-
-Se valida todo antes de insertar. Las altas son idempotentes, no actualizan
-filas existentes ni borran su historial/volumen. SQLite y la caché de Central
-se coordinan bajo el mismo bloqueo, publicando en memoria tras el commit.
-Esta operación no reinicia Central ni sustituye la autenticación por sockets.
-
-FO acepta ahora `--file`/`--batch-file` como opción de arranque: primero
-recupera el servicio anterior, luego procesa el archivo y vuelve al menú.
-SIGTERM en FO y Engine activa el cierre habitual; una caída abrupta conserva
-la recuperación mediante los diarios ya descritos.
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
+La ruta `/api/admin/catalog` se mantiene por compatibilidad con el lanzador
+anterior. Comparte la transacción y la lógica de inserción con `/api/catalog`;
+admite hasta 1000 entradas por lista, IDs personalizados de 1-80 caracteres
+ASCII alfanuméricos, guion o guion bajo, y descripciones de hasta 200 caracteres.
+El BAT usa `/api/catalog`, con un máximo de 500 entradas, IDs FO-NN/WS-NN y
+descripciones de hasta 100 caracteres. Ambas rutas devuelven `ok`, `created`,
+`operators` y `stations`, y no requieren contraseña. El cuerpo HTTP máximo es
+1 MiB. FO y Engine conservan el cierre ordenado al recibir SIGTERM.

@@ -3,10 +3,7 @@ import argparse
 from collections import defaultdict, deque
 import json
 from pathlib import Path
-<<<<<<< HEAD
-=======
 import signal
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 import sys
 import time
 import uuid
@@ -167,43 +164,8 @@ def check_recovery(producer, consumer, operator_id, active_order, last_completed
     elif saved:
         print("[RECUPERACIÓN] Confirmando la orden pendiente con su mismo identificador.")
         request = dict(saved, type="REQUEST")
-<<<<<<< HEAD
-        # Conservar la fecha antigua solo como información. Central decide por
-        # el mismo ID persistente, sin comparar relojes de equipos distintos.
-        request.setdefault("submitted_at", saved.get("time", 0))
-        publish(producer, "fo_requests", request)
-        follow_order(producer, consumer, operator_id, request)
-
-
-def execute_file(producer, consumer, operator_id, path, stations):
-    """Cada línea es una petición independiente; un error no aborta las demás."""
-    with open(path, encoding="utf-8-sig") as stream:
-        lines = [(n, line.strip()) for n, line in enumerate(stream, 1) if line.strip()]
-    for index, (number, line) in enumerate(lines):
-        try:
-            ws, text = line.split(",")
-            execute_irrigation(producer, consumer, operator_id, ws.strip(), int(text), stations)
-        except ValueError as error:
-            print(f"[ERROR] Línea {number}: {error}")
-        except (TimeoutError, KafkaError, OSError):
-            # Se desconoce si el riego terminó: no solapar el siguiente servicio.
-            print("[AVISO] Lote pausado; consulta la orden pendiente antes de continuar.")
-            raise
-        if index + 1 < len(lines):
-            print("Esperando 4 segundos para la siguiente petición...")
-            time.sleep(4)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Aplicación del Operario de Campo (WM_FO)")
-    parser.add_argument("--kafka-broker", required=True)
-    parser.add_argument("--id-operario", required=True)
-    parser.add_argument("--file", "--batch-file", dest="batch_file",
-                        help="Ejecutar este archivo tras recuperar el servicio pendiente")
-    args = parser.parse_args()
-    safe_id(args.id_operario)
-=======
-        # Un checkpoint antiguo sin fecha no debe activar un riego histórico.
+        # La fecha se conserva como información; Central recupera por el mismo
+        # ID persistente, sin comparar relojes de ordenadores distintos.
         request.setdefault("submitted_at", saved.get("time", 0))
         publish(producer, "fo_requests", request)
         follow_order(producer, consumer, operator_id, request)
@@ -234,7 +196,6 @@ def termination_signal(signum, frame):
 
 
 def run(args):
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     producer, raw_consumer = open_bus(args.kafka_broker, ("fo_responses",))
     consumer = ResponseInbox(raw_consumer, args.id_operario)
     try:
@@ -242,13 +203,8 @@ def run(args):
             stations, active, completed = get_stations(producer, consumer, args.id_operario)
             check_recovery(producer, consumer, args.id_operario, active, completed)
             if args.batch_file:
-<<<<<<< HEAD
-                # Reutilizamos las validaciones y la pausa de 4 s del menú.
-                # Si la recuperación falla, no se empieza un lote nuevo.
-=======
                 # Recuperar primero impide que el lote solape una orden pendiente.
                 # Se conserva la lógica del menú: validación, espera y persistencia.
->>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
                 execute_file(producer, consumer, args.id_operario, args.batch_file, stations)
         except (TimeoutError, OSError, KafkaError) as error:
             print(f"[FO] {error}")
