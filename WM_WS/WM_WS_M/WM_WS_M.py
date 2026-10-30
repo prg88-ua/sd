@@ -4,6 +4,10 @@ import socket
 import threading
 import time
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from wm_common import LineReader, field, send_line
 
 

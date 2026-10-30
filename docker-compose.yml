@@ -3,6 +3,10 @@ services:
     image: apache/kafka:3.9.1
     hostname: broker
     restart: unless-stopped
+    labels:
+      org.watermanagement.launcher: ${WM_LAUNCHER_NAMESPACE:-wm-lab}
+      org.watermanagement.profile: cloud
+      org.watermanagement.kind: broker
 
     ports:
       - "9092:9092"
@@ -40,11 +44,16 @@ services:
 
   central:
     build: .
-    image: water-management:local
+    image: ${WM_IMAGE:-water-management:local}
     restart: unless-stopped
+    labels:
+      org.watermanagement.launcher: ${WM_LAUNCHER_NAMESPACE:-wm-lab}
+      org.watermanagement.profile: cloud
+      org.watermanagement.kind: central
 
     environment:
       DB_PATH: /data/water_management.db
+      WM_SEED_DEMO: ${WM_SEED_DEMO:-0}
 
     command: ["python", "WM_Central/WM_Central.py", "--socket-port", "6000", "--kafka-broker", "broker:29092"]
 

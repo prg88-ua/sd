@@ -1,63 +1,24 @@
 """Engine: mide y comunica el riego real, incluido el interrumpido."""
 import argparse
-import json
-import os
 import queue
+import signal
 import socket
 import threading
 import time
 import uuid
+import sys
+from pathlib import Path
+
+# Permite ejecutar este archivo directamente desde cualquier carpeta.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from wm_common import (
     LineReader, messages, open_bus, publish, send_line,
 )
 
+from wm_state import EngineJournal
+
 FLOW = 15.0  # Litros/minuto de la simulacion.
-
-
-def get_engine_state_file(station):
-    return f"engine_state_{station}.json"
-
-
-def save_engine_state(station, run, elapsed, volume, status="IN_PROGRESS"):
-    state_file = get_engine_state_file(station)
-    tmp_file = f"{state_file}.tmp"
-    data = {
-        "id": run["id"],
-        "ws": station,
-        "operator": run.get("operator"),
-        "duration": run.get("duration"),
-        "elapsed": round(elapsed, 3),
-        "volume": round(volume, 4),
-        "status": status,
-        "timestamp": time.time(),
-    }
-    try:
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp_file, state_file)
-    except Exception as e:
-        print(f"[PERSISTENCIA] Error guardando estado: {e}", flush=True)
-
-
-def clear_engine_state(station):
-    state_file = get_engine_state_file(station)
-    try:
-        if os.path.exists(state_file):
-            os.remove(state_file)
-    except OSError:
-        pass
-
-
-def load_engine_state(station):
-    state_file = get_engine_state_file(station)
-    if os.path.exists(state_file):
-        try:
-            with open(state_file, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
 
 
 class Valve:
@@ -70,19 +31,28 @@ class Valve:
         self.current = None
         self.stop = threading.Event()
         self.reason = "PARADA_MANUAL"
+        self.journal = EngineJournal(station)
+        self.worker = None
 
     def event(self, kind, run, **data):
-        self.outbox.put({
-            "type": kind,
-            "id": run["id"],
-            "ws": self.station,
-            **data,
-        })
+        event = dict(type=kind, id=run["id"], ws=self.station,
+                     operator=run.get("operator"), start_time=run.get("start_time"), **data)
+        if kind == "END":
+            # La cola de RAM no es persistencia: guardar ANTES de encolar.
+            self.journal.save(event, "FINAL_PENDING")
+        self.outbox.put(event)
 
     def start(self, run):
         with self.lock:
             if self.current and self.current["id"] == run["id"]:
                 return
+
+            previous = self.journal.get(run["id"])
+            if previous:
+                status, saved = previous
+                if status in ("FINAL_PENDING", "DELIVERED"):
+                    self.outbox.put(saved)  # Reenviar el final, nunca repetir el riego.
+                    return
 
             if (
                 self.current
@@ -91,8 +61,9 @@ class Valve:
                 or time.time() > run.get("expires", 0)
             ):
                 self.event(
-                    "REJECTED",
+                    "END",
                     run,
+                    volume=0, elapsed=0, flow=0,
                     reason="ENGINE_NO_DISPONIBLE",
                 )
                 return
@@ -104,7 +75,8 @@ class Valve:
                 or not 1 <= duration <= 3600
             ):
                 self.event(
-                    "REJECTED", run, reason="DURACION_INVALIDA"
+                    "END", run, volume=0, elapsed=0, flow=0,
+                    reason="DURACION_INVALIDA"
                 )
                 return
 
@@ -112,18 +84,21 @@ class Valve:
             self.stop.clear()
             self.reason = "PARADA_MANUAL"
 
-            threading.Thread(
+            self.worker = threading.Thread(
                 target=self.water,
                 args=(run,),
                 daemon=True,
-            ).start()
+            )
+            self.worker.start()
 
     def close(self, reason, request_id=None):
         with self.lock:
-            if self.current and (
+            if self.current and not self.stop.is_set() and (
                 request_id is None
                 or self.current["id"] == request_id
             ):
+                # La primera causa cierra el riego; otra desconexión durante el
+                # apagado no debe sobrescribirla antes de guardar el resultado.
                 self.reason = reason
                 self.stop.set()
 
@@ -133,9 +108,9 @@ class Valve:
         started = None
 
         try:
+            self.journal.save(dict(run, elapsed=0.0, volume=0.0), "IN_PROGRESS")
             self.event("STARTED", run)
             started = time.monotonic()
-            save_engine_state(self.station, run, 0.0, 0.0, "IN_PROGRESS")
 
             print("[VALVULA] ABIERTA", flush=True)
 
@@ -154,7 +129,7 @@ class Valve:
                     run["duration"], time.monotonic() - started
                 )
                 volume = FLOW * elapsed / 60
-                save_engine_state(self.station, run, elapsed, volume, "IN_PROGRESS")
+                self.journal.save(dict(run, elapsed=round(elapsed, 3), volume=round(volume, 4)), "IN_PROGRESS")
 
                 if (
                     stopped
@@ -184,7 +159,7 @@ class Valve:
                 )
 
         except Exception as error:
-            reason = "ERROR_KAFKA"
+            reason = "ERROR_ENGINE"
             print(f"[RIEGO] {error}", flush=True)
 
         finally:
@@ -194,9 +169,6 @@ class Valve:
                     run["duration"], time.monotonic() - started
                 )
                 volume = FLOW * elapsed / 60
-
-            with self.lock:
-                self.current = None
 
             print(
                 f"[VALVULA] CERRADA: {reason}, {volume:.2f} L",
@@ -212,12 +184,14 @@ class Valve:
                     elapsed=round(elapsed, 3),
                     reason=reason,
                 )
-                clear_engine_state(self.station)
             except Exception as error:
                 print(
                     f"[FIN] No pudo notificarse: {error}",
                     flush=True,
                 )
+            finally:
+                with self.lock:
+                    self.current = None
 
 
 def sender(producer, outbox, stopped, valve):
@@ -234,6 +208,9 @@ def sender(producer, outbox, stopped, valve):
                 pending = outbox.get(timeout=0.5)
 
             publish(producer, "ws_events", pending)
+            if pending["type"] == "END":
+                # Solo el ACK del broker permite dar por entregado este resultado.
+                valve.journal.delivered(pending["id"])
             pending = None
 
         except queue.Empty:
@@ -362,11 +339,12 @@ def keyboard(
                     "operator": operator,
                     "ws": station,
                     "duration": duration,
+                    "submitted_at": time.time(),
                 })
 
             elif option == "s":
-                stopped.set()
                 valve.close("APAGADO_ENGINE")
+                stopped.set()
 
         except EOFError:
             return
@@ -375,13 +353,7 @@ def keyboard(
             print(f"[MENU] {error}", flush=True)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--monitor-host", default="localhost")
-    parser.add_argument("--monitor-port", type=int, required=True)
-    parser.add_argument("--kafka-broker", required=True)
-    args = parser.parse_args()
-
+def run(args):
     # Preparar Kafka antes de responder OK a las comprobaciones de salud.
     producer, consumer = open_bus(
         args.kafka_broker, ("ws_orders",)
@@ -418,15 +390,22 @@ def main():
     fault = threading.Event()
     link = threading.Event()
     stopped = threading.Event()
+    sender_stopped = threading.Event()
 
     outbox = queue.Queue()
     valve = Valve(station, outbox, fault, link)
 
-    threading.Thread(
+    for event in valve.journal.recover():
+        print(f"[RECUPERACIÓN] Resultado pendiente: {event['id']}", flush=True)
+        outbox.put(event)
+
+    sender_thread = threading.Thread(
         target=sender,
-        args=(producer, outbox, stopped, valve),
+        # El emisor sigue vivo hasta que la válvula haya guardado y encolado END.
+        args=(producer, outbox, sender_stopped, valve),
         daemon=True,
-    ).start()
+    )
+    sender_thread.start()
 
     threading.Thread(
         target=monitor_loop,
@@ -444,32 +423,6 @@ def main():
     ).start()
 
     print(f"[ENGINE] Identidad: {station}", flush=True)
-
-    # Requisito de Resiliencia: si el Engine cayo durante un riego,
-    # al recuperarse envia el estado final con los litros reales regados a medias.
-    saved = load_engine_state(station)
-    if saved and saved.get("status") == "IN_PROGRESS":
-        print(
-            f"[RECUPERACION] Detectado riego previo interrumpido por caída súbita: "
-            f"ID={saved['id']}, Volumen={saved['volume']:.2f} L, Tiempo={saved['elapsed']:.1f} s",
-            flush=True,
-        )
-        recovery_event = {
-            "type": "END",
-            "id": saved["id"],
-            "ws": station,
-            "flow": 0.0,
-            "volume": float(saved["volume"]),
-            "elapsed": float(saved["elapsed"]),
-            "reason": "INTERRUMPIDO_POR_CAIDA_ENGINE",
-            "operator": saved.get("operator"),
-        }
-        try:
-            publish(producer, "ws_events", recovery_event)
-            print("[RECUPERACION] Estado final del riego enviado a CENTRAL vía Kafka", flush=True)
-        except Exception as err:
-            print(f"[RECUPERACION] Error enviando estado final a Kafka: {err}", flush=True)
-        clear_engine_state(station)
 
     try:
         while not stopped.is_set():
@@ -496,12 +449,45 @@ def main():
         pass
 
     finally:
-        stopped.set()
-        valve.close("APAGADO_ENGINE")
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer)
 
-        # Dar tiempo a notificar el cierre antes de terminar.
-        time.sleep(2)
-        consumer.close()
+
+def shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer):
+    """Cerrar, guardar y después intentar confirmar el resultado en Kafka."""
+    valve.close("APAGADO_ENGINE")
+    stopped.set()
+    if valve.worker:
+        valve.worker.join(timeout=5)
+    # No anunciar «no habrá más eventos» antes de que termine quien produce END.
+    # Si el disco está bloqueado, el emisor puede continuar mientras esperamos.
+    if valve.worker is None or not valve.worker.is_alive():
+        sender_stopped.set()
+    sender_thread.join(timeout=15)
+    if sender_thread.is_alive():
+        print("[CIERRE] Entrega no confirmada; el diario se recuperará al arrancar.", flush=True)
+    consumer.close()
+    producer.close(timeout=2)
+
+
+def termination_signal(signum, frame):
+    # SIGTERM (docker stop) y Ctrl+C recorren el mismo finally de recuperación.
+    raise KeyboardInterrupt
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--monitor-host", default="localhost")
+    parser.add_argument("--monitor-port", type=int, required=True)
+    parser.add_argument("--kafka-broker", required=True)
+    args = parser.parse_args()
+    previous = signal.signal(signal.SIGTERM, termination_signal)
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        print("[ENGINE] Arranque interrumpido; se conserva el diario.", flush=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

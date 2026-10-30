@@ -223,3 +223,8 @@ __marimo__/
 *.db-wal
 *.db-shm
 water_management.db
+
+# Estado privado de ejecución; no forma parte del código fuente.
+.wm_state/
+engine_state_*.json
+fo_state_*.json

@@ -11,3 +11,15 @@
 **/*.db-journal
 **/*.db-wal
 **/*.db-shm
+.wm_state
+engine_state_*.json
+fo_state_*.json
+dist
+build
+tools
+wm_launcher
+wm.py
+WaterManagement.cmd
+requirements-build.txt
+tests
+docs

@@ -93,3 +93,41 @@ El Engine envía mediciones aproximadamente cada segundo y comunica la finalizac
 Si se pierde la comunicación y no puede obtenerse la medida final, CENTRAL comunica una interrupción identificada como tal y utiliza la última medición recibida.
 
 Cada instancia consume los mensajes y filtra por estación o petición. Al arrancar no ejecuta órdenes antiguas.
+
+
+## Recuperación persistente (revisión de resiliencia)
+
+- REQUEST añade submitted_at (segundos Unix). Central deniega pedidos no
+  registrados sin fecha o de más de 60 segundos. LIST admite recover_id.
+- STATIONS añade active_order y last_completed, recuperados desde SQLite.
+- END incluye final y updated_at en respuestas del FO. final=false identifica
+  una última medida provisional; una medida posterior del Engine puede corregirla.
+- Los eventos del Engine incluyen operator y start_time para mantener la
+  correlación al importar checkpoints anteriores.
+- request_id es único en el historial. Reenviar REQUEST/START/END con el mismo
+  ID no crea un segundo riego ni duplica la fila de historial.
+- Central persiste la posición por topic/partición junto con los efectos del
+  mensaje y su outbox. En Engine, FINAL_PENDING permanece hasta el ACK del broker.
+- Un resultado de otro ID no cambia los datos del riego actual de la estación.
+- La WS mantiene sus latidos locales y completa el riego aunque caiga Central.
+
+## Altas administrativas del lanzador
+
+`POST /api/admin/catalog` recibe JSON con arrays opcionales `operators`
+(`id`, `name`) y `stations` (`id`, `location`). Cada array admite hasta 1000
+elementos. El ID admite 1-80 letras ASCII, números, guion o guion bajo. Los
+textos admiten 1-200 caracteres y no pueden contener separadores de sockets.
+
+No requiere contraseña ni cabecera de autenticación. Devuelve 400 para un lote
+inválido, 413 si el cuerpo supera 1 MiB y 200 con `created`, `operators` y
+`stations` cuando el alta es correcta.
+
+Se valida todo antes de insertar. Las altas son idempotentes, no actualizan
+filas existentes ni borran su historial/volumen. SQLite y la caché de Central
+se coordinan bajo el mismo bloqueo, publicando en memoria tras el commit.
+Esta operación no reinicia Central ni sustituye la autenticación por sockets.
+
+FO acepta ahora `--file`/`--batch-file` como opción de arranque: primero
+recupera el servicio anterior, luego procesa el archivo y vuelve al menú.
+SIGTERM en FO y Engine activa el cierre habitual; una caída abrupta conserva
+la recuperación mediante los diarios ya descritos.

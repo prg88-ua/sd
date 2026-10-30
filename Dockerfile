@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # Mostrar logs inmediatamente y permitir importar wm_common desde cualquier modulo.
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONPATH=/app WM_STATE_DIR=/data
 
 WORKDIR /app
 
