@@ -33,7 +33,7 @@ class CatalogTests(unittest.TestCase):
 
     def post(self, payload=None, headers=None):
         return self.client.post(
-            "/api/admin/catalog",
+            "/api/catalog",
             json=self.payload if payload is None else payload,
             headers={} if headers is None else headers,
         )
@@ -111,8 +111,8 @@ class CatalogTests(unittest.TestCase):
     def test_database_failure_rolls_back_catalog_before_publishing_cache(self):
         with database.connection() as conn:
             conn.execute("""CREATE TRIGGER reject_station BEFORE INSERT ON watering_stations
-                            WHEN NEW.id='WS-BAD' BEGIN SELECT RAISE(ABORT,'fallo simulado'); END""")
-        self.payload["stations"].append({"id": "WS-BAD", "location": "Parque"})
+                            WHEN NEW.id='WS-99' BEGIN SELECT RAISE(ABORT,'fallo simulado'); END""")
+        self.payload["stations"].append({"id": "WS-99", "location": "Parque"})
         with self.assertRaises(sqlite3.IntegrityError):
             self.central.register_catalog(self.payload)
         self.assertEqual(self.counts(), (0, 0, 0))
@@ -123,7 +123,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(self.counts(), (1, 1, 0))
 
     def test_catalog_rejects_oversized_http_body_without_writing(self):
-        response = self.client.post("/api/admin/catalog", data="x" * (1024 * 1024 + 1),
+        response = self.client.post("/api/catalog", data="x" * (1024 * 1024 + 1),
                                     content_type="application/json")
         self.assertEqual(response.status_code, 413)
         self.assertEqual(self.counts(), (0, 0, 0))
@@ -137,9 +137,9 @@ class CatalogTests(unittest.TestCase):
             {"stations": [{"id": "WS-20", "location": "a#b"}]},
             {"stations": [{"id": "WS-20", "location": "a\nb"}]},
             {"stations": [{"id": "a" * 81, "location": "Parque"}]},
-            {"operators": [{"id": "FO-20", "name": "x" * 201}]},
+            {"operators": [{"id": "FO-20", "name": "x" * 101}]},
             {"operators": [{"id": "FO-20", "name": "Operario"}] * 2},
-            {"operators": [{"id": "FO-20", "name": "Operario"}] * 1001},
+            {"operators": [{"id": "FO-20", "name": "Operario"}] * 501},
         ]
         for payload in invalid:
             with self.subTest(payload=str(payload)[:100]):
@@ -148,7 +148,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_invalid_json_is_rejected(self):
         response = self.client.post(
-            "/api/admin/catalog", data="{bad", content_type="application/json",
+            "/api/catalog", data="{bad", content_type="application/json",
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(self.counts(), (0, 0, 0))

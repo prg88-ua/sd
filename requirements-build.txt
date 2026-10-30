@@ -1,2 +1,0 @@
-# Solo para generar el ejecutable; los usuarios del .exe no instalan Python.
-PyInstaller==6.22.3

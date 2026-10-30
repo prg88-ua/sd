@@ -17,9 +17,5 @@ fo_state_*.json
 dist
 build
 tools
-wm_launcher
-wm.py
-WaterManagement.cmd
-requirements-build.txt
+WaterManagement.bat
 tests
-docs

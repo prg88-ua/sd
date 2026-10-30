@@ -17,7 +17,6 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from WM_Central.database import connection, init_db
 from WM_Central.logs import CentralLogs
-from wm_state import safe_id
 
 from wm_common import (
     LineReader, field, open_bus, publish, send_line,
@@ -147,7 +146,7 @@ class Central:
                 for ws in self.stations.values()
             ]
 
-    def register_catalog(self, payload, *, strict_ids=False):
+    def register_catalog(self, payload):
         """Da de alta identidades sin modificar un riego ni una fila existente.
 
         Validamos TODO el lote antes de abrir la transacción. El mismo bloqueo
@@ -157,7 +156,7 @@ class Central:
         if not isinstance(payload, dict) or set(payload) - {"operators", "stations"}:
             raise ValueError("El catálogo debe contener operators y/o stations")
         catalog = {}
-        limit = 500 if strict_ids else 1000
+        limit = 500
         for kind, label in (("operators", "name"), ("stations", "location")):
             entries = payload.get(kind, [])
             if not isinstance(entries, list) or len(entries) > limit:
@@ -167,20 +166,18 @@ class Central:
             for entry in entries:
                 if not isinstance(entry, dict) or set(entry) != {"id", label}:
                     raise ValueError(f"Cada elemento de {kind} necesita id y {label}")
-                identity = safe_id(entry["id"])
-                if len(identity) > 80:
-                    raise ValueError("El identificador no puede superar 80 caracteres")
-                # El BAT trabaja con FO-01 / WS-01; la API anterior también
-                # admite IDs personalizados. Ambas comparten la misma escritura.
-                if strict_ids:
-                    prefix = "FO" if kind == "operators" else "WS"
-                    if (not re.fullmatch(prefix + r"-[0-9]{2,6}", identity)
-                            or int(identity.split("-")[1]) < 1):
-                        raise ValueError("ID de operario o estación inválido")
+                identity = entry["id"]
+                # Solo existe el catálogo del BAT: FO-01 / WS-01. No hacen
+                # falta otra ruta ni reglas distintas para el lanzador retirado.
+                prefix = "FO" if kind == "operators" else "WS"
+                if (not isinstance(identity, str)
+                        or not re.fullmatch(prefix + r"-[0-9]{2,6}", identity)
+                        or int(identity.split("-")[1]) < 1):
+                    raise ValueError("ID de operario o estación inválido")
                 text = entry[label]
-                text_limit = 100 if strict_ids else 200
+                text_limit = 100
                 if not isinstance(text, str) or not field(text) or len(text) > text_limit:
-                    raise ValueError(f"{label} debe tener entre 1 y 200 caracteres sin # ni saltos")
+                    raise ValueError(f"{label} debe tener entre 1 y 100 caracteres sin # ni saltos")
                 if identity in identities:
                     raise ValueError(f"ID repetido dentro de {kind}: {identity}")
                 identities.add(identity)
@@ -697,12 +694,9 @@ def create_app(central):
         return response
 
     @app.post("/api/catalog")
-    @app.post("/api/admin/catalog")
     def catalog():
         try:
-            return jsonify(central.register_catalog(
-                request.get_json(silent=True), strict_ids=request.path == "/api/catalog",
-            ))
+            return jsonify(central.register_catalog(request.get_json(silent=True)))
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
 

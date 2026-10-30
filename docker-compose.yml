@@ -3,10 +3,6 @@ services:
     image: apache/kafka:3.9.1
     hostname: broker
     restart: unless-stopped
-    labels:
-      org.watermanagement.launcher: ${WM_LAUNCHER_NAMESPACE:-wm-lab}
-      org.watermanagement.profile: cloud
-      org.watermanagement.kind: broker
 
     ports:
       - "9092:9092"
@@ -44,12 +40,8 @@ services:
 
   central:
     build: .
-    image: ${WM_IMAGE:-water-management:local}
+    image: water-management:local
     restart: unless-stopped
-    labels:
-      org.watermanagement.launcher: ${WM_LAUNCHER_NAMESPACE:-wm-lab}
-      org.watermanagement.profile: cloud
-      org.watermanagement.kind: central
 
     environment:
       DB_PATH: /data/water_management.db

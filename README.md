@@ -1,5 +1,11 @@
 # Water Management - Pau y Pablo
 
+La versión final se utiliza con `WaterManagement.bat`, el código de los
+componentes, Docker y el panel web. `tools/` conserva las instrucciones y el
+constructor del BAT; `tests/` comprueba el sistema final; `contracts/` documenta
+los mensajes y las altas. Las dependencias de la aplicación están únicamente en
+`requirements.txt`.
+
 ## Lanzador para Windows usando el código descargado (BAT)
 
 En los PCs del laboratorio descargad el proyecto y abrid **`WaterManagement.bat`**

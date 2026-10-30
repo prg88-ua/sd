@@ -125,11 +125,7 @@ POST /api/catalog recibe operators (lista de objetos con id y name) y stations
 Los IDs nuevos se incorporan a SQLite y a la memoria de Central sin reiniciar.
 Repetir un alta conserva las descripciones, estados e historial existentes.
 
-La ruta `/api/admin/catalog` se mantiene por compatibilidad con el lanzador
-anterior. Comparte la transacción y la lógica de inserción con `/api/catalog`;
-admite hasta 1000 entradas por lista, IDs personalizados de 1-80 caracteres
-ASCII alfanuméricos, guion o guion bajo, y descripciones de hasta 200 caracteres.
-El BAT usa `/api/catalog`, con un máximo de 500 entradas, IDs FO-NN/WS-NN y
-descripciones de hasta 100 caracteres. Ambas rutas devuelven `ok`, `created`,
-`operators` y `stations`, y no requieren contraseña. El cuerpo HTTP máximo es
+El BAT usa `/api/catalog`, con un máximo de 500 entradas por lista, IDs
+FO-NN/WS-NN y descripciones de hasta 100 caracteres. La ruta devuelve `ok`,
+`created`, `operators` y `stations`, y no requiere contraseña. El cuerpo HTTP máximo es
 1 MiB. FO y Engine conservan el cierre ordenado al recibir SIGTERM.
