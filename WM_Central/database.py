@@ -30,7 +30,8 @@ def connection():
         conn.close()
 
 
-def init_db():
+def init_db(seed_demo=True):
+    """Crea/migra el esquema; las tres identidades de ejemplo son opcionales."""
     Path(DB_NAME).parent.mkdir(parents=True, exist_ok=True)
 
     with connection() as conn:
@@ -92,6 +93,7 @@ def init_db():
 
         if "last_request_id" not in columns:
             conn.execute("ALTER TABLE watering_stations ADD COLUMN last_request_id TEXT")
+<<<<<<< HEAD
 
         history_columns = {
             r["name"] for r in conn.execute("PRAGMA table_info(irrigation_history)")
@@ -109,15 +111,35 @@ def init_db():
                 ("FO-03", "Operario 3"),
             ],
         )
+=======
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
-        conn.executemany(
-            "INSERT OR IGNORE INTO watering_stations(id,location) VALUES (?,?)",
-            [
-                ("WS-01", "Parque Central"),
-                ("WS-02", "Jardines del Rio"),
-                ("WS-03", "Plaza Mayor"),
-            ],
-        )
+        history_columns = {
+            r["name"] for r in conn.execute("PRAGMA table_info(irrigation_history)")
+        }
+        if "request_id" not in history_columns:
+            conn.execute("ALTER TABLE irrigation_history ADD COLUMN request_id TEXT")
+        # Los registros antiguos, sin identificador, se conservan sin modificarlos.
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS history_request ON irrigation_history(request_id)")
+
+        if seed_demo:
+            conn.executemany(
+                "INSERT OR IGNORE INTO operators(id,name) VALUES (?,?)",
+                [
+                    ("FO-01", "Operario 1"),
+                    ("FO-02", "Operario 2"),
+                    ("FO-03", "Operario 3"),
+                ],
+            )
+
+            conn.executemany(
+                "INSERT OR IGNORE INTO watering_stations(id,location) VALUES (?,?)",
+                [
+                    ("WS-01", "Parque Central"),
+                    ("WS-02", "Jardines del Rio"),
+                    ("WS-03", "Plaza Mayor"),
+                ],
+            )
 
 
 if __name__ == "__main__":

@@ -14,3 +14,15 @@
 .wm_state
 engine_state_*.json
 fo_state_*.json
+<<<<<<< HEAD
+=======
+dist
+build
+tools
+wm_launcher
+wm.py
+WaterManagement.cmd
+requirements-build.txt
+tests
+docs
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65

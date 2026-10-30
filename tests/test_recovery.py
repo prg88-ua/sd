@@ -192,6 +192,7 @@ class CentralTests(IsolatedTest):
             restarted.flush_outbox(None)
         self.assertEqual(self.count("central_outbox"), 0)
 
+<<<<<<< HEAD
     def test_clock_skew_does_not_reject_requests(self):
         for offset in (-86400, 86400):
             with self.subTest(offset=offset):
@@ -210,6 +211,13 @@ class CentralTests(IsolatedTest):
         central.handle_request(request)
         self.assertFalse(central.active)
         self.assertEqual(self.count("irrigation_history"), 1)
+=======
+    def test_expired_unregistered_request_cannot_reopen_valve(self):
+        central = self.central()
+        central.handle_request(dict(self.request(), submitted_at=time.time()-3600))
+        self.assertFalse(central.active)
+        self.assertEqual(central.load_request("A")[0], "DENIED")
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
     def test_invalid_measures_are_not_saved(self):
         central = self.central()
@@ -241,6 +249,7 @@ class CentralTests(IsolatedTest):
 
 
 class OperatorTests(IsolatedTest):
+<<<<<<< HEAD
     def test_startup_batch_runs_after_recovery(self):
         producer = unittest.mock.Mock()
         raw = FakeConsumer()
@@ -266,6 +275,8 @@ class OperatorTests(IsolatedTest):
             fo.main()
         batch.assert_not_called()
 
+=======
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     def test_stations_and_end_in_same_poll_are_preserved(self):
         raw = FakeConsumer()
         raw.add(dict(type="STATIONS", id="L", operator="FO-01"),
@@ -394,6 +405,7 @@ class EngineTests(IsolatedTest):
         worker.assert_not_called()
         self.assertEqual(valve.outbox.get()["type"], "END")
 
+<<<<<<< HEAD
     def test_expiry_from_a_different_clock_does_not_block_start(self):
         for expires in (1, None):
             with self.subTest(expires=expires):
@@ -405,6 +417,8 @@ class EngineTests(IsolatedTest):
                     valve.start(request)
                 worker.return_value.start.assert_called_once()
 
+=======
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     def test_rejected_start_cannot_run_later_after_repair(self):
         valve = self.valve()
         valve.fault.set()

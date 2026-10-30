@@ -2,7 +2,11 @@
 import argparse
 import json
 import math
+<<<<<<< HEAD
 import re
+=======
+import os
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 import socket
 import sys
 import threading
@@ -15,7 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from flask import Flask, jsonify, request, send_from_directory
 
 from WM_Central.database import connection, init_db
+<<<<<<< HEAD
 from WM_Central.logs import CentralLogs
+=======
+from wm_state import safe_id
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
 from wm_common import (
     LineReader, field, open_bus, publish, send_line,
@@ -24,7 +32,10 @@ from wm_common import (
 
 class Central:
     def __init__(self):
+<<<<<<< HEAD
         self.logs = CentralLogs()
+=======
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
         self.lock = threading.RLock()
         self.ready = threading.Event()
         self.monitors = {}
@@ -47,6 +58,105 @@ class Central:
         """El mismo evento se conserva para el panel y sigue saliendo en Docker."""
         entry = self.logs.append(message, level)
         print(entry["message"], flush=True)
+
+    def restore_requests(self):
+        """La memoria es una caché; SQLite conserva la verdad tras una caída."""
+        self.active = {}
+        self.last_completed_by_operator = {}
+        with connection() as conn:
+            rows = conn.execute("SELECT status,payload FROM requests").fetchall()
+            for row in conn.execute("SELECT * FROM watering_stations"):
+                self.stations[row["id"]].update(dict(row))
+        for row in rows:
+            run = json.loads(row["payload"])
+            if row["status"] == "ACTIVE":
+                run["last_event"] = time.monotonic()
+                self.active[run["ws"]] = run
+            elif row["status"] in ("FINAL", "PROVISIONAL"):
+                self.remember_result(run)
+
+    def remember_result(self, result):
+        previous = self.last_completed_by_operator.get(result.get("operator"))
+        # Una corrección tardía no sustituye el resultado de un riego más reciente.
+        if not previous or result["timestamp"] >= previous["timestamp"]:
+            self.last_completed_by_operator[result["operator"]] = result
+
+    def store_request(self, run, status):
+        with connection() as conn:
+            conn.execute("""
+                INSERT INTO requests VALUES (?,?,?)
+                ON CONFLICT(request_id) DO UPDATE
+                SET status=excluded.status,payload=excluded.payload
+            """, (run["id"], status, json.dumps(run)))
+
+    def load_request(self, request_id):
+        with connection() as conn:
+            row = conn.execute("SELECT status,payload FROM requests WHERE request_id=?",
+                               (request_id,)).fetchone()
+        return (row["status"], json.loads(row["payload"])) if row else None
+
+    def register_catalog(self, payload):
+        """Da de alta identidades sin modificar un riego ni una fila existente.
+
+        Validamos TODO el lote antes de abrir la transacción. El mismo bloqueo
+        que usan Kafka y los monitores protege también la caché de estaciones;
+        así una identidad nueva está disponible sin reiniciar Central.
+        """
+        if not isinstance(payload, dict) or set(payload) - {"operators", "stations"}:
+            raise ValueError("El catálogo debe contener operators y/o stations")
+        catalog = {}
+        for kind, label in (("operators", "name"), ("stations", "location")):
+            entries = payload.get(kind, [])
+            if not isinstance(entries, list) or len(entries) > 1000:
+                raise ValueError(f"{kind} debe ser una lista de hasta 1000 elementos")
+            normalized = []
+            identities = set()
+            for entry in entries:
+                if not isinstance(entry, dict) or set(entry) != {"id", label}:
+                    raise ValueError(f"Cada elemento de {kind} necesita id y {label}")
+                identity = safe_id(entry["id"])
+                if len(identity) > 80:
+                    raise ValueError("El identificador no puede superar 80 caracteres")
+                text = entry[label]
+                if not isinstance(text, str) or not field(text) or len(text) > 200:
+                    raise ValueError(f"{label} debe tener entre 1 y 200 caracteres sin # ni saltos")
+                if identity in identities:
+                    raise ValueError(f"ID repetido dentro de {kind}: {identity}")
+                identities.add(identity)
+                normalized.append((identity, text))
+            catalog[kind] = normalized
+
+        created = {"operators": 0, "stations": 0}
+        with self.lock:
+            pending_stations = {}
+            with connection() as conn:
+                for identity, name in catalog["operators"]:
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO operators(id,name) VALUES (?,?)",
+                        (identity, name),
+                    )
+                    created["operators"] += cursor.rowcount
+                for identity, location in catalog["stations"]:
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO watering_stations(id,location) VALUES (?,?)",
+                        (identity, location),
+                    )
+                    created["stations"] += cursor.rowcount
+                    if identity not in self.stations:
+                        row = conn.execute(
+                            "SELECT * FROM watering_stations WHERE id=?", (identity,)
+                        ).fetchone()
+                        station = dict(row)
+                        station.update(live=False, health=None, seen=0)
+                        pending_stations[identity] = station
+            # Publicar en memoria SOLO después de confirmar SQLite. Ante error,
+            # no queda una estación fantasma que la BD haya deshecho.
+            self.stations.update(pending_stations)
+        return {
+            "created": created,
+            "operators": [identity for identity, _ in catalog["operators"]],
+            "stations": [identity for identity, _ in catalog["stations"]],
+        }
 
     def restore_requests(self):
         """La memoria es una caché; SQLite conserva la verdad tras una caída."""
@@ -126,11 +236,14 @@ class Central:
 
         if ws["id"] in self.active:
             self.store_request(self.active[ws["id"]], "ACTIVE")
+<<<<<<< HEAD
         # save se llama también en cada HEALTH: registrar solo transiciones
         # evita llenar la terminal de OK repetidos y de medidas idénticas.
         if previous_status != ws["status"]:
             level = "WARNING" if ws["status"] in ("LEAK", "OFFLINE") else "INFO"
             self.log(f"[ESTADO] {ws['id']}: {previous_status} -> {ws['status']}", level)
+=======
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
     def snapshot(self):
         with self.lock, connection():
@@ -217,7 +330,11 @@ class Central:
             self.save(ws)
         self.reply(result, "END", volume=run["volume"], elapsed=run["elapsed"],
                    reason=reason, final=not provisional, updated_at=result["updated_at"])
+<<<<<<< HEAD
         self.log(f"[FIN] {ws_id}: {reason}, {run['volume']:.2f} L")
+=======
+        print(f"[FIN] {ws_id}: {reason}, {run['volume']:.2f} L", flush=True)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
     def finish(self, ws_id, reason):
         with self.lock, connection():
@@ -275,11 +392,19 @@ class Central:
                 return
             ws_id = message["ws"]
             duration = message.get("duration")
+            submitted = message.get("submitted_at")
             ws = self.stations.get(ws_id)
             reason = None
+<<<<<<< HEAD
             # Los PCs pueden tener horas distintas. La fecha es informativa;
             # la identidad persistente de la petición evita ejecutar duplicados.
             if type(duration) is not int or not 1 <= duration <= 3600:
+=======
+            if not isinstance(submitted, (int, float)) or not math.isfinite(submitted) or not -5 <= time.time()-submitted <= 60:
+                # Evita ejecutar pedidos históricos al migrar o vaciar los offsets.
+                reason = "PETICION_CADUCADA_O_SIN_FECHA"
+            elif type(duration) is not int or not 1 <= duration <= 3600:
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
                 reason = "DURACION_INVALIDA"
             elif ws is None:
                 reason = "ESTACION_NO_EXISTE"
@@ -298,8 +423,13 @@ class Central:
                       last_request_id=run["id"])
             self.save(ws)
             self.reply(run, "PENDING", reason="ESPERANDO_CONFIRMACION_ENGINE")
+<<<<<<< HEAD
             self.emit("ws_orders", dict(run, type="START"))
             self.log(f"[SOLICITUD] {message['operator']} -> {ws_id}, {duration} s, ID {run['id']}")
+=======
+            self.emit("ws_orders", dict(run, type="START", expires=time.time()+12))
+            print(f"[SOLICITUD] {message}", flush=True)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
     def handle_event(self, message):
         with self.lock, connection():
@@ -585,7 +715,11 @@ class Central:
                 else:
                     self.handle_event(message)
             except (UnicodeError, ValueError, TypeError, KeyError) as error:
+<<<<<<< HEAD
                 self.log(f"[MENSAJE INVALIDO] {error}", "WARNING")
+=======
+                print(f"[MENSAJE INVALIDO] {error}", flush=True)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
             conn.execute("""
                 INSERT INTO kafka_offsets VALUES (?,?,?)
                 ON CONFLICT(topic,partition_id) DO UPDATE SET next_offset=excluded.next_offset
@@ -609,12 +743,19 @@ class Central:
                     if all(confirmed.get((p.topic, p.partition), 0) >= target
                            for p, target in targets.items()):
                         self.recovering = False
+<<<<<<< HEAD
                         if not self.ready.is_set():
                             self.log("[KAFKA] Conectado. Recuperación de mensajes completada.")
                         self.ready.set()
                     self.flush_outbox(producer)
             except Exception as error:
                 self.log(f"[KAFKA] Reconectando: {error}", "ERROR")
+=======
+                        self.ready.set()
+                    self.flush_outbox(producer)
+            except Exception as error:
+                print(f"[KAFKA] Reconectando: {error}", flush=True)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
                 # Si falló una escritura, descartar también su caché en memoria.
                 with self.lock:
                     self.restore_requests()
@@ -625,9 +766,16 @@ class Central:
 
 
 def create_app(central):
+<<<<<<< HEAD
     """Separar HTTP del arranque permite probar las altas sin Docker ni Kafka."""
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 256 * 1024
+=======
+    """Construye la API sin arrancar Kafka, sockets ni el servidor HTTP."""
+    app = Flask(__name__)
+    # El catálogo tiene un máximo por lista y también un límite de cuerpo HTTP.
+    app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     dashboard = Path(__file__).resolve().parents[1] / "WM_Dashboard"
 
     @app.get("/")
@@ -644,6 +792,7 @@ def create_app(central):
     def stations():
         return jsonify(central.snapshot())
 
+<<<<<<< HEAD
     @app.get("/api/logs")
     def logs():
         try:
@@ -662,6 +811,17 @@ def create_app(central):
             return jsonify(central.register_catalog(request.get_json(silent=True)))
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
+=======
+    @app.post("/api/admin/catalog")
+    def register_catalog():
+        # El lanzador puede ampliar el catálogo sin una clave adicional.
+        # Se mantienen la validación del lote y la actualización atómica.
+        try:
+            result = central.register_catalog(request.get_json(silent=True))
+        except ValueError as error:
+            return jsonify(error=str(error)), 400
+        return jsonify(result)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
     @app.post("/api/stations/<ws_id>/<action>")
     def action(ws_id, action):
@@ -681,15 +841,34 @@ def main():
     parser.add_argument("--socket-port", type=int, required=True)
     parser.add_argument("--kafka-broker", required=True)
     args = parser.parse_args()
+<<<<<<< HEAD
     init_db()
     central = Central()
+=======
+
+    # Un escenario de una sola estación no debe añadir las otras dos del demo.
+    # La migración sigue conservando todas las identidades y datos ya guardados.
+    seed_demo = os.environ.get("WM_SEED_DEMO", "0").strip().lower() in ("1", "true", "yes")
+    init_db(seed_demo=seed_demo)
+    central = Central()
+
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     for target, values in (
         (central.kafka, (args.kafka_broker,)),
         (central.sockets, (args.socket_port,)),
         (central.watchdog, ()),
     ):
+<<<<<<< HEAD
         threading.Thread(target=target, args=values, daemon=True).start()
     create_app(central).run(
+=======
+        threading.Thread(
+            target=target, args=values, daemon=True
+        ).start()
+
+    app = create_app(central)
+    app.run(
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
         host="0.0.0.0",
         port=5000,
         debug=False,

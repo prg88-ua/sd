@@ -1,5 +1,6 @@
 # Water Management - Pau y Pablo
 
+<<<<<<< HEAD
 ## Lanzador para Windows usando el código descargado (BAT)
 
 En los PCs del laboratorio descargad el proyecto y abrid **`WaterManagement.bat`**
@@ -99,6 +100,41 @@ docker compose logs -f
 Central usa SQLite en el volumen `sqlite_data`; Kafka conserva su registro
 en `kafka_data`. Reiniciar los servicios conserva ambos volúmenes.
 
+=======
+## Lanzador con menú y terminales (Windows)
+
+Abrir `dist/WaterManagement.exe`: elegir `fo` en PC LAB 1 y `ws` en PC LAB 2,
+indicar la IP de AWS y utilizar el menú para añadir instancias, fijar un total,
+recuperar por ID, abrir consolas, simular caídas y ejecutar `CLEAN`. Cada FO
+abre una terminal; cada WS abre dos (Monitor y Engine). Docker Desktop debe
+estar funcionando. `WaterManagement.cmd` también abre el lanzador.
+
+Antes es necesario actualizar Central en AWS:
+el lanzador da de alta IDs directamente, sin contraseña y sin reiniciar Central.
+El almacenamiento existente se conserva. Una BD nueva ya no crea tres
+operarios/estaciones por defecto; se registran desde el lanzador.
+
+La [guía del lanzador](docs/LANZADOR.md) contiene los pasos completos de AWS,
+uso del ejecutable, comandos equivalentes, recuperación y empaquetado.
+
+## 1. Preparar la nube
+
+En el grupo de seguridad de AWS deben estar accesibles 5000/TCP (panel),
+6000/TCP (Monitor-Central) y 9092/TCP (Kafka). Sustituye las IP de ejemplo
+por las de tu despliegue.
+
+```bash
+git clone https://github.com/prg88-ua/sd.git
+cd sd
+export KAFKA_PUBLIC_HOST=<IP_PUBLICA_AWS>
+docker compose up -d --build
+docker compose logs -f
+```
+
+Central usa SQLite en el volumen `sqlite_data`; Kafka conserva su registro
+en `kafka_data`. Reiniciar los servicios conserva ambos volúmenes.
+
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 ## 2. Preparar los dos PCs del laboratorio
 
 ```bash
@@ -112,6 +148,14 @@ esa opción habilitada). En PowerShell se pueden ejecutar en una sola línea,
 eliminando las barras de continuación. Usa un nombre y puerto distinto para
 cada estación o contenedor adicional.
 
+<<<<<<< HEAD
+=======
+Para los comandos manuales siguientes, registrar antes sus IDs con el
+lanzador (`register --fo 3 --ws 3`, configurado hacia AWS), o activar
+expresamente `WM_SEED_DEMO=1` al desplegar Central. El lanzador nuevo crea
+automáticamente las altas necesarias al abrir cada componente.
+
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 ## 3. Estaciones en el PC LAB 2
 
 Terminal 1 - Monitor de WS-01:
@@ -197,6 +241,7 @@ el proceso.
 - Un resultado tardío corrige su propia fila de historial; nunca borra
   las medidas de otro riego. Las últimas medidas estimadas de Central
   se identifican como provisionales.
+<<<<<<< HEAD
 - Las fechas son informativas. Central no rechaza una petición por
   `submitted_at` y Engine no compara `expires` con su reloj: AWS y los PCs
   pueden tener horas distintas. Los IDs persistentes siguen evitando repetir
@@ -204,6 +249,12 @@ el proceso.
   lleve tiempo en Kafka; ya no existe un filtro de antigüedad por fecha.
 - Las duraciones de riego, los latidos y los límites de espera se miden con
   reloj monotónico local: no requieren que los ordenadores tengan la misma hora.
+=======
+- Los pedidos llevan `submitted_at`. Una petición nunca registrada que
+  tenga más de 60 segundos, o no tenga fecha, se deniega para no ejecutar
+  órdenes históricas al actualizar el sistema. Un ID ya registrado puede
+  consultarse o reenviarse aunque sea más antiguo.
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
 Los archivos JSON antiguos que todavía estén en el directorio de trabajo se
 importan automáticamente al nuevo estado local. La base SQLite de Central

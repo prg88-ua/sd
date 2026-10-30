@@ -95,10 +95,12 @@ class Valve:
 
     def close(self, reason, request_id=None):
         with self.lock:
-            if self.current and (
+            if self.current and not self.stop.is_set() and (
                 request_id is None
                 or self.current["id"] == request_id
             ):
+                # La primera causa cierra el riego; otra desconexión durante el
+                # apagado no debe sobrescribirla antes de guardar el resultado.
                 self.reason = reason
                 self.stop.set()
 
@@ -343,8 +345,8 @@ def keyboard(
                 })
 
             elif option == "s":
-                stopped.set()
                 valve.close("APAGADO_ENGINE")
+                stopped.set()
 
         except EOFError:
             return
@@ -353,6 +355,7 @@ def keyboard(
             print(f"[MENU] {error}", flush=True)
 
 
+<<<<<<< HEAD
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--monitor-host", default="localhost")
@@ -366,6 +369,9 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
 
+=======
+def run(args):
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
     # Preparar Kafka antes de responder OK a las comprobaciones de salud.
     producer, consumer = open_bus(
         args.kafka_broker, ("ws_orders",)
@@ -402,6 +408,7 @@ def main():
     fault = threading.Event()
     link = threading.Event()
     stopped = threading.Event()
+    sender_stopped = threading.Event()
 
     outbox = queue.Queue()
     valve = Valve(station, outbox, fault, link)
@@ -413,6 +420,10 @@ def main():
 
     sender_thread = threading.Thread(
         target=sender,
+<<<<<<< HEAD
+=======
+        # El emisor sigue vivo hasta que la válvula haya guardado y encolado END.
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
         args=(producer, outbox, sender_stopped, valve),
         daemon=True,
     )
@@ -460,9 +471,10 @@ def main():
         pass
 
     finally:
-        stopped.set()
-        valve.close("APAGADO_ENGINE")
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer)
 
+<<<<<<< HEAD
         if valve.worker:
             valve.worker.join(timeout=3)
         # Mantener al emisor vivo hasta que el trabajador haya guardado END.
@@ -471,6 +483,44 @@ def main():
         sender_thread.join(timeout=2)
         consumer.close()
         producer.close(timeout=2)
+=======
+
+def shutdown(valve, stopped, sender_stopped, sender_thread, consumer, producer):
+    """Cerrar, guardar y después intentar confirmar el resultado en Kafka."""
+    valve.close("APAGADO_ENGINE")
+    stopped.set()
+    if valve.worker:
+        valve.worker.join(timeout=5)
+    # No anunciar «no habrá más eventos» antes de que termine quien produce END.
+    # Si el disco está bloqueado, el emisor puede continuar mientras esperamos.
+    if valve.worker is None or not valve.worker.is_alive():
+        sender_stopped.set()
+    sender_thread.join(timeout=15)
+    if sender_thread.is_alive():
+        print("[CIERRE] Entrega no confirmada; el diario se recuperará al arrancar.", flush=True)
+    consumer.close()
+    producer.close(timeout=2)
+
+
+def termination_signal(signum, frame):
+    # SIGTERM (docker stop) y Ctrl+C recorren el mismo finally de recuperación.
+    raise KeyboardInterrupt
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--monitor-host", default="localhost")
+    parser.add_argument("--monitor-port", type=int, required=True)
+    parser.add_argument("--kafka-broker", required=True)
+    args = parser.parse_args()
+    previous = signal.signal(signal.SIGTERM, termination_signal)
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        print("[ENGINE] Arranque interrumpido; se conserva el diario.", flush=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+>>>>>>> ce6e17a39e6545c2362bef76892aa9fe80007e65
 
 
 if __name__ == "__main__":
