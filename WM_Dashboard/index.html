@@ -10,6 +10,19 @@
         /* Animación para el color VERDE PARPADEANDO que pide la práctica */
         @keyframes blink { 50% { opacity: 0.5; } }
         .blink-green { animation: blink 1.5s linear infinite; background-color: #22c55e; }
+        /* Terminal de solo lectura: las líneas largas se ajustan sin ensanchar el panel. */
+        .log-terminal { background: #080d16; color: #cbd5e1; font: 13px/1.7 Consolas, "Courier New", monospace;
+            height: 320px; max-height: 55vh; overflow-y: auto; padding: 16px; overflow-wrap: anywhere; }
+        .log-entry { white-space: pre-wrap; }
+        .log-time { color: #718096; }
+        .log-level { color: #67e8f9; }
+        .log-warning .log-level, .log-warning .log-message { color: #fcd34d; }
+        .log-error .log-level, .log-error .log-message { color: #fca5a5; }
+        .log-notice { color: #94a3b8; font-style: italic; }
+        .terminal-heading { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+            padding: 14px 16px; align-items: center; background: #111827; border-bottom: 1px solid #374151; }
+        .terminal-button { border: 1px solid #4b5563; border-radius: 5px; padding: 4px 10px; font-size: 12px; }
+        .terminal-button:hover { background: #374151; }
     </style>
 </head>
 <body class="bg-gray-900 text-white font-sans p-8">
@@ -67,6 +80,26 @@
                 </tbody>
             </table>
         </div>
+        <!-- Vista de los eventos de Central; no ejecuta comandos del sistema. -->
+        <section class="mt-8 rounded-lg overflow-hidden border border-gray-700 shadow-lg" aria-labelledby="logs-title">
+            <div class="terminal-heading">
+                <div>
+                    <h2 id="logs-title" class="font-mono font-bold text-gray-100">&gt;_ Logs de Central</h2>
+                    <p class="text-xs text-gray-400 mt-1">Solo lectura · últimos 500 eventos · hora de Central</p>
+                </div>
+                <div class="flex flex-wrap items-center gap-3">
+                    <span id="logs-status" class="text-xs text-gray-400" role="status">Conectando...</span>
+                    <label class="text-xs text-gray-300 flex items-center gap-1">
+                        <input id="logs-follow" type="checkbox" checked> Seguir últimos
+                    </label>
+                    <button id="logs-pause" class="terminal-button" type="button" aria-pressed="false">Pausar</button>
+                    <button id="logs-clear" class="terminal-button" type="button">Limpiar vista</button>
+                </div>
+            </div>
+            <div id="logs-output" class="log-terminal" role="log" aria-label="Eventos de Central" aria-live="off" tabindex="0">
+                <div class="log-notice" id="logs-empty">Esperando actividad de Central...</div>
+            </div>
+        </section>
     </div>
 
     <script>
@@ -227,6 +260,110 @@
             }
         }
 
+        const logsOutput = document.getElementById('logs-output');
+        const logsStatus = document.getElementById('logs-status');
+        const logsFollow = document.getElementById('logs-follow');
+        const logsPause = document.getElementById('logs-pause');
+        let logsCursor = 0;
+        let logsSession = '';
+        let logsPaused = false;
+        let logsRequestVersion = 0;
+
+        function setLogsStatus(text, connected = false) {
+            logsStatus.textContent = text;
+            logsStatus.className = connected ? 'text-xs text-green-400' : 'text-xs text-gray-400';
+        }
+
+        function appendLogNotice(message) {
+            const line = document.createElement('div');
+            line.className = 'log-entry log-notice';
+            line.textContent = message;
+            logsOutput.appendChild(line);
+        }
+
+        function appendLogEntry(entry) {
+            const line = document.createElement('div');
+            const level = ['INFO', 'WARNING', 'ERROR'].includes(entry.level) ? entry.level : 'INFO';
+            line.className = `log-entry log-${level.toLowerCase()}`;
+            const timestamp = document.createElement('span');
+            timestamp.className = 'log-time';
+            timestamp.textContent = `[${entry.time.replace('T', ' ')}] `;
+            const severity = document.createElement('span');
+            severity.className = 'log-level';
+            severity.textContent = `${level.padEnd(7)} `;
+            const message = document.createElement('span');
+            message.className = 'log-message';
+            // Los mensajes pueden contener datos externos: mostrarlos como texto
+            // impide que un log se interprete como HTML o ejecute JavaScript.
+            message.textContent = entry.message;
+            line.append(timestamp, severity, message);
+            logsOutput.appendChild(line);
+        }
+
+        function trimLogsView() {
+            while (logsOutput.childElementCount > 500) {
+                logsOutput.firstElementChild.remove();
+            }
+            if (logsFollow.checked) { logsOutput.scrollTop = logsOutput.scrollHeight; }
+        }
+
+        logsPause.addEventListener('click', () => {
+            logsPaused = !logsPaused;
+            // Invalidar una petición ya en vuelo hace que la pausa sea inmediata.
+            logsRequestVersion++;
+            logsPause.textContent = logsPaused ? 'Reanudar' : 'Pausar';
+            logsPause.setAttribute('aria-pressed', String(logsPaused));
+            setLogsStatus(logsPaused ? 'En pausa' : 'Conectando...');
+        });
+
+        document.getElementById('logs-clear').addEventListener('click', () => {
+            logsOutput.replaceChildren();
+            appendLogNotice('Vista limpia. Los nuevos eventos aparecerán aquí.');
+            // No reiniciar el cursor: limpiar la vista no debe volver a traer
+            // todo el historial ni borrar los logs de otros navegadores.
+        });
+
+        logsFollow.addEventListener('change', trimLogsView);
+
+        async function fetchLogs() {
+            if (logsPaused) { setTimeout(fetchLogs, 1000); return; }
+            const requestVersion = logsRequestVersion;
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 8000);
+            try {
+                const params = new URLSearchParams({ after: String(logsCursor), session: logsSession });
+                const response = await fetch(`/api/logs?${params}`, { cache: 'no-store', signal: controller.signal });
+                if (!response.ok) { throw new Error('No se pudieron leer los logs'); }
+                const result = await response.json();
+                if (logsPaused || requestVersion !== logsRequestVersion) { return; }
+                if (result.reset) {
+                    logsOutput.replaceChildren();
+                    appendLogNotice('Central se ha reiniciado. Mostrando los eventos de la nueva sesión.');
+                }
+                if (result.truncated) {
+                    appendLogNotice('Se muestran los últimos eventos disponibles; algunos anteriores ya no se conservan.');
+                }
+                if (result.entries.length) {
+                    document.getElementById('logs-empty')?.remove();
+                    result.entries.forEach(appendLogEntry);
+                }
+                logsCursor = result.last_id;
+                logsSession = result.session;
+                trimLogsView();
+                setLogsStatus('En directo', true);
+            } catch (error) {
+                if (!logsPaused && requestVersion === logsRequestVersion) {
+                    setLogsStatus('Sin conexión · reintentando...');
+                }
+            } finally {
+                clearTimeout(timeout);
+                // Programar la siguiente lectura al terminar evita acumular
+                // peticiones si AWS tarda en responder o se pierde la conexión.
+                setTimeout(fetchLogs, 1000);
+            }
+        }
+
+        fetchLogs();
         setInterval(fetchStations, 1000);
         fetchStations(); 
     </script>

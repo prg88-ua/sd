@@ -55,7 +55,7 @@ class LineReader:
         return line.decode("utf-8")
 
 
-def open_bus(broker, topics):
+def open_bus(broker, topics, offsets=None):
     """Reintenta el arranque y cierra conexiones creadas a medias."""
     while True:
         producer = consumer = admin = None
@@ -97,14 +97,18 @@ def open_bus(broker, topics):
 
                 partitions.extend(TopicPartition(name, i) for i in ids)
 
-            # Cada modulo recibe los mensajes y filtra por su identificador.
-            # Arrancamos al final para no ejecutar ordenes antiguas.
             consumer.assign(partitions)
-
-            # Consultar el final de cada particion y fijarlo directamente.
-            # Asi empezamos con mensajes nuevos sin bloquear position().
-            positions = consumer.end_offsets(partitions)
-
+            if offsets is None:
+                positions = consumer.end_offsets(partitions)
+            else:
+                # Central reanuda desde el punto confirmado en SQLite, incluso
+                # si END se publicó mientras el proceso estaba apagado.
+                positions = consumer.beginning_offsets(partitions)
+                for partition in partitions:
+                    saved = offsets.get((partition.topic, partition.partition), positions[partition])
+                    if saved < positions[partition]:
+                        raise RuntimeError("Kafka eliminó mensajes pendientes por retención")
+                    positions[partition] = saved
             for partition, offset in positions.items():
                 consumer.seek(partition, offset)
 

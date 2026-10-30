@@ -1,23 +1,32 @@
 """SQLite persistente. Inicializar no borra los datos existentes."""
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
 DB_NAME = os.getenv(
     "DB_PATH", str(Path(__file__).with_name("water_management.db"))
 )
+_local = threading.local()
 
 
 @contextmanager
 def connection():
+    # Las llamadas anidadas de un mismo hilo comparten UNA transacción.
+    # Así, pedido + respuesta pendiente + posición Kafka se confirman juntos.
+    if getattr(_local, "conn", None) is not None:
+        yield _local.conn
+        return
     conn = sqlite3.connect(DB_NAME, timeout=15)
     conn.row_factory = sqlite3.Row
+    _local.conn = conn
 
     try:
         with conn:
             yield conn
     finally:
+        _local.conn = None
         conn.close()
 
 
@@ -50,6 +59,23 @@ def init_db():
                 end_time TEXT,
                 total_volume REAL
             );
+
+            CREATE TABLE IF NOT EXISTS requests (
+                request_id TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS central_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kafka_offsets (
+                topic TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                next_offset INTEGER NOT NULL,
+                PRIMARY KEY (topic, partition_id)
+            );
         """)
 
         # Permite utilizar una BD anterior sin borrar sus tablas.
@@ -63,6 +89,17 @@ def init_db():
                 "ALTER TABLE watering_stations "
                 "ADD COLUMN blocked INTEGER DEFAULT 0"
             )
+
+        if "last_request_id" not in columns:
+            conn.execute("ALTER TABLE watering_stations ADD COLUMN last_request_id TEXT")
+
+        history_columns = {
+            r["name"] for r in conn.execute("PRAGMA table_info(irrigation_history)")
+        }
+        if "request_id" not in history_columns:
+            conn.execute("ALTER TABLE irrigation_history ADD COLUMN request_id TEXT")
+        # Los registros antiguos, sin identificador, se conservan sin modificarlos.
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS history_request ON irrigation_history(request_id)")
 
         conn.executemany(
             "INSERT OR IGNORE INTO operators(id,name) VALUES (?,?)",

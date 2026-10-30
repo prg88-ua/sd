@@ -11,3 +11,6 @@
 **/*.db-journal
 **/*.db-wal
 **/*.db-shm
+.wm_state
+engine_state_*.json
+fo_state_*.json

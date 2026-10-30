@@ -4,6 +4,10 @@ import socket
 import threading
 import time
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 from wm_common import LineReader, field, send_line
 
 
@@ -111,6 +115,12 @@ class Monitor:
                 ).start()
 
     def run(self):
+        # Al arrancar todavía no hay una comprobación válida del Engine.
+        # Conservar el último estado fuera de la reconexión evita repetirlo
+        # al recuperar Central: la consola solo muestra cambios reales.
+        last_reported_health = "KO"
+        print("[SALUD] KO", flush=True)
+
         threading.Thread(
             target=self.engine_server, daemon=True
         ).start()
@@ -154,7 +164,11 @@ class Monitor:
                                 "Respuesta HEALTH incorrecta"
                             )
 
-                        print(f"[SALUD] {code}", flush=True)
+                        # HEALTH sigue siendo periódico para detectar caídas;
+                        # lo que evitamos es imprimir el mismo estado sin parar.
+                        if code != last_reported_health:
+                            print(f"[SALUD] {code}", flush=True)
+                            last_reported_health = code
 
                         time.sleep(
                             max(0, 1 - (time.monotonic() - started))

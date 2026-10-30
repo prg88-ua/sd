@@ -70,7 +70,7 @@ Campos:
 
 - "LIST": "type", "id", "operator".
 - "REQUEST": "type", "id", "operator", "ws", "duration".
-- "START": los campos de REQUEST y "expires", instante de caducidad de la orden.
+- "START": los campos de REQUEST. No requiere fecha de caducidad.
 - "STOP": "type", "id", "ws", "reason".
 - "STARTED": "type", "id", "ws".
 - "REJECTED": "type", "id", "ws", "reason".
@@ -92,4 +92,35 @@ El Engine envía mediciones aproximadamente cada segundo y comunica la finalizac
 
 Si se pierde la comunicación y no puede obtenerse la medida final, CENTRAL comunica una interrupción identificada como tal y utiliza la última medición recibida.
 
-Cada instancia consume los mensajes y filtra por estación o petición. Al arrancar no ejecuta órdenes antiguas.
+Cada instancia consume los mensajes y filtra por estación o petición. El Engine
+inicia su lectura al final de Kafka y utiliza su diario para recuperar resultados;
+los IDs persistentes impiden ejecutar dos veces un riego ya conocido. Central
+recupera los mensajes pendientes desde sus posiciones guardadas.
+
+
+## Recuperación persistente (revisión de resiliencia)
+
+- REQUEST puede incluir submitted_at (segundos Unix) como información.
+  Central no deniega pedidos por su antigüedad ni por faltar esa fecha.
+  Engine ignora expires si llega de una versión anterior. Así no hace falta
+  sincronizar la hora de AWS y los PCs. LIST admite recover_id.
+- Las duraciones, latidos y esperas siguen usando intervalos monotónicos
+  locales. Las peticiones pendientes nunca procesadas no caducan por fecha.
+- STATIONS añade active_order y last_completed, recuperados desde SQLite.
+- END incluye final y updated_at en respuestas del FO. final=false identifica
+  una última medida provisional; una medida posterior del Engine puede corregirla.
+- Los eventos del Engine incluyen operator y start_time para mantener la
+  correlación al importar checkpoints anteriores.
+- request_id es único en el historial. Reenviar REQUEST/START/END con el mismo
+  ID no crea un segundo riego ni duplica la fila de historial.
+- Central persiste la posición por topic/partición junto con los efectos del
+  mensaje y su outbox. En Engine, FINAL_PENDING permanece hasta el ACK del broker.
+- Un resultado de otro ID no cambia los datos del riego actual de la estación.
+- La WS mantiene sus latidos locales y completa el riego aunque caiga Central.
+
+## Altas desde el BAT
+
+POST /api/catalog recibe operators (lista de objetos con id y name) y stations
+(lista de objetos con id y location). Valida el lote completo antes de insertar.
+Los IDs nuevos se incorporan a SQLite y a la memoria de Central sin reiniciar.
+Repetir un alta conserva las descripciones, estados e historial existentes.
