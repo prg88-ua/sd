@@ -1,4 +1,5 @@
 """Utilidades compartidas: sockets por lineas y mensajes Kafka JSON."""
+import errno
 import json
 import socket
 import time
@@ -7,6 +8,26 @@ from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import TopicAlreadyExistsError
 
 TOPICS = ("fo_requests", "fo_responses", "ws_orders", "ws_events")
+
+
+def socket_error_message(error, *, retry=False, peer=None):
+    """Traduce solo errores del sistema; los mensajes del protocolo no cambian."""
+    # errno procede de OSError, no de buscar numeros en el texto del mensaje.
+    # Asi una validacion o un rechazo de registro conserva su explicacion exacta.
+    if not isinstance(error, OSError) or error.errno is None:
+        return None
+
+    target = f" con {peer}" if peer else ""
+    if error.errno in (errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE):
+        message = f"Se ha interrumpido la conexión{target}."
+    elif error.errno == errno.ECONNREFUSED:
+        message = f"No se puede establecer la conexión{target}."
+    elif error.errno == errno.ETIMEDOUT:
+        message = "La conexión no ha respondido a tiempo."
+    else:
+        message = f"Se ha producido un error de comunicación{target}."
+
+    return message + (" Reintentando..." if retry else "")
 
 
 def field(value):

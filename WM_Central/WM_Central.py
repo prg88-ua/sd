@@ -19,7 +19,7 @@ from WM_Central.database import connection, init_db
 from WM_Central.logs import CentralLogs
 
 from wm_common import (
-    LineReader, field, open_bus, publish, send_line,
+    LineReader, field, open_bus, publish, send_line, socket_error_message,
 )
 
 
@@ -524,7 +524,8 @@ class Central:
                         send_line(sock, "STATUS#ERROR#INVALID_MESSAGE")
 
         except (OSError, ConnectionError, ValueError) as error:
-            self.log(f"[SOCKET] {error}", "ERROR")
+            message = socket_error_message(error) or str(error)
+            self.log(f"[SOCKET] {message}", "ERROR")
 
         finally:
             with self.lock, connection():

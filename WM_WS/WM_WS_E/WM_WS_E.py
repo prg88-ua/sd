@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from wm_common import (
-    LineReader, messages, open_bus, publish, send_line,
+    LineReader, messages, open_bus, publish, send_line, socket_error_message,
 )
 
 from wm_state import EngineJournal
@@ -283,8 +283,9 @@ def monitor_loop(
                     )
 
         except (OSError, ValueError, ConnectionError) as error:
+            message = socket_error_message(error, retry=True) or f"Reconectando: {error}"
             print(
-                f"[MONITOR] Reconectando: {error}",
+                f"[MONITOR] {message}",
                 flush=True,
             )
 
@@ -385,7 +386,8 @@ def run(args):
             if sock is not None:
                 sock.close()
 
-            print(f"[IDENTIDAD] {error}", flush=True)
+            message = socket_error_message(error) or str(error)
+            print(f"[IDENTIDAD] {message}", flush=True)
             time.sleep(2)
 
     fault = threading.Event()

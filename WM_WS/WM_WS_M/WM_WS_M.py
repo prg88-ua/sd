@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from wm_common import LineReader, field, send_line
+from wm_common import LineReader, field, send_line, socket_error_message
 
 
 class Monitor:
@@ -86,7 +86,8 @@ class Monitor:
                 )
 
         except (OSError, ValueError, ConnectionError) as error:
-            print(f"[ENGINE] {error}", flush=True)
+            message = socket_error_message(error, peer="el Engine") or str(error)
+            print(f"[ENGINE] {message}", flush=True)
 
         finally:
             with self.lock:
@@ -175,8 +176,9 @@ class Monitor:
                         )
 
             except (OSError, ValueError, ConnectionError) as error:
+                message = socket_error_message(error, retry=True) or f"Reconectando: {error}"
                 print(
-                    f"[CENTRAL] Reconectando: {error}",
+                    f"[CENTRAL] {message}",
                     flush=True,
                 )
 
